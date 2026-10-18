@@ -54,6 +54,27 @@ jobs:
             --base-href "$BASE_HREF" \
             --dart-define="CHATTERBOX_API=$CHATTERBOX_API_URL"
 
+<<<<<<< HEAD
+=======
+      - name: Create app download page
+        working-directory: client
+        run: |
+          cat > build/web/downloads.html <<EOF
+          <!doctype html>
+          <html lang="en">
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="theme-color" content="#111318">
+          <title>Install ChatterBox</title>
+          <style>body{font:16px system-ui;background:#111318;color:#f4f4f6;max-width:620px;margin:12vh auto;padding:24px}a{color:#aeb9ff}.card{background:#191b22;border-radius:16px;padding:24px;margin:16px 0}h1{color:#fff}li{margin:10px 0}</style>
+          <h1>Install ChatterBox</h1>
+          <div class="card"><h2>Android</h2><p><a href="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/latest/download/ChatterBox-Android.apk">Download the latest Android APK</a> from GitHub Releases.</p><ol><li>Open the downloaded APK on your phone.</li><li>If prompted, allow your browser or file manager to install unknown apps.</li><li>Tap Install, then open ChatterBox.</li></ol></div>
+          <div class="card"><h2>iPhone and iPad</h2><p>Open ChatterBox in Safari, tap Share, then choose <b>Add to Home Screen</b> to install the web app. Native iOS distribution requires an Apple-signed build.</p></div>
+          <p><a href="./">Open ChatterBox</a></p>
+          </html>
+          EOF
+
+>>>>>>> 135ac43 (Initial commit of my program files)
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
