@@ -1,0 +1,25 @@
+# Flutter and Dart outputs
+client/.dart_tool/
+client/.flutter-plugins
+client/.flutter-plugins-dependencies
+client/build/
+client/coverage/
+
+# Platform-local build and signing files
+client/android/local.properties
+client/android/key.properties
+client/ios/Flutter/Generated.xcconfig
+client/ios/Flutter/flutter_export_environment.sh
+
+# Firebase credentials/configuration are environment-specific
+client/android/app/google-services.json
+client/ios/Runner/GoogleService-Info.plist
+client/lib/firebase_options.dart
+**/*.jks
+**/*.keystore
+
+# Local environment and compiled artifacts
+.env
+.env.*
+/main
+/server/chatterbox-server

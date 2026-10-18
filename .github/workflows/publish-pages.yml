@@ -1,0 +1,64 @@
+name: Publish ChatterBox web app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Install Flutter packages
+        working-directory: client
+        run: flutter pub get
+
+      - name: Build Flutter web app
+        working-directory: client
+        env:
+          CHATTERBOX_API_URL: ${{ vars.CHATTERBOX_API_URL }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          REPOSITORY_NAME="${REPOSITORY#*/}"
+          if [[ "$REPOSITORY_NAME" == "$REPOSITORY_OWNER.github.io" ]]; then
+            BASE_HREF="/"
+          else
+            BASE_HREF="/$REPOSITORY_NAME/"
+          fi
+          flutter build web --release \
+            --base-href "$BASE_HREF" \
+            --dart-define="CHATTERBOX_API=$CHATTERBOX_API_URL"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: client/build/web
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
