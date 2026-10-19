@@ -54,8 +54,6 @@ jobs:
             --base-href "$BASE_HREF" \
             --dart-define="CHATTERBOX_API=$CHATTERBOX_API_URL"
 
-<<<<<<< HEAD
-=======
       - name: Create app download page
         working-directory: client
         run: |
@@ -74,7 +72,6 @@ jobs:
           </html>
           EOF
 
->>>>>>> 135ac43 (Initial commit of my program files)
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
