@@ -1,4 +1,33 @@
 name: Package Android app
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Grant execute permission for Gradle
+        run: chmod +x gradlew
+
+      # This step physically compiles your code and generates the APK
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug
+
+      # Your original upload step (adjust path if needed)
+      - name: Save APK as workflow artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatterBox-Android
+          # Note: Standard native Android apps output to the path below.
+          # If your app outputs specifically to 'dist/', keep your original path.
+          path: app/build/outputs/apk/debug/*.apk 
+          if-no-files-found: error
+          retention-days: 30
 
 on:
   push:
