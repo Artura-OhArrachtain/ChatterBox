@@ -43,6 +43,8 @@ git push origin v1.0.0
 
 6. Wait for the **Package Android app** workflow to finish. It creates a GitHub Release containing **ChatterBox-Android.apk** for direct installation and **ChatterBox-Android.aab** for Google Play. Future updates must be signed with the same keystore.
 
+To attach an APK to a release without using git commands, open **Actions → Package Android app → Run workflow**, enter the existing release tag (for example, `v1.0.0`), and run it. The workflow builds the APK and App Bundle and attaches both to that release. Leave the tag field empty to build an APK artifact only.
+
 To publish the web install page, enable **Settings → Pages → Build and deployment → GitHub Actions**. The Pages workflow deploys the site after pushes to `main`; first publication may take a few minutes.
 
 ## Run locally

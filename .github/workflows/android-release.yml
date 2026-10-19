@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to attach the APK to; leave blank to create a build artifact only.
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -26,7 +31,7 @@ jobs:
         run: flutter pub get
 
       - name: Validate release configuration
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || inputs.release_tag != ''
         env:
           CHATTERBOX_API_URL: ${{ vars.CHATTERBOX_API_URL }}
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -48,7 +53,7 @@ jobs:
           fi
 
       - name: Configure Android release signing
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || inputs.release_tag != ''
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -69,10 +74,12 @@ jobs:
         env:
           CHATTERBOX_API_URL: ${{ vars.CHATTERBOX_API_URL }}
           RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
           RELEASE_EVENT: ${{ github.event_name }}
           BUILD_NUMBER: ${{ github.run_number }}
         run: |
-          if [[ "$RELEASE_EVENT" == "push" ]]; then
+          if [[ "$RELEASE_EVENT" == "push" || -n "$RELEASE_TAG_INPUT" ]]; then
+            if [[ "$RELEASE_EVENT" != "push" ]]; then RELEASE_TAG="$RELEASE_TAG_INPUT"; fi
             BUILD_NAME="${RELEASE_TAG#v}"
           else
             BUILD_NAME="$(sed -n 's/^version: \([^+]*\).*/\1/p' pubspec.yaml)"
@@ -86,12 +93,12 @@ jobs:
         env:
           CHATTERBOX_API_URL: ${{ vars.CHATTERBOX_API_URL }}
           RELEASE_EVENT: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
           BUILD_NUMBER: ${{ github.run_number }}
         run: |
           mkdir -p dist
           cp client/build/app/outputs/flutter-apk/app-release.apk dist/ChatterBox-Android.apk
-          if [[ "$RELEASE_EVENT" == "push" ]]; then
+          if [[ -n "$RELEASE_TAG" ]]; then
             BUILD_NAME="${RELEASE_TAG#v}"
             (cd client && flutter build appbundle --release \
               --build-name="$BUILD_NAME" \
@@ -101,16 +108,17 @@ jobs:
           fi
 
       - name: Attach APK to GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
           generate_release_notes: true
           files: |
             dist/ChatterBox-Android.apk
             dist/ChatterBox-Android.aab
 
       - name: Save APK as workflow artifact
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
         uses: actions/upload-artifact@v4
         with:
           name: ChatterBox-Android
