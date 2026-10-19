@@ -1,4 +1,6 @@
 name: Package Android app
+permissions:
+  contents: write
 
 on:
   push:
