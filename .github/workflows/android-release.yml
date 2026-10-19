@@ -1,36 +1,4 @@
-name: Package Android app
-      steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-
-      - name: Set up Java Development Kit (JDK) 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Set up Flutter SDK
-        uses: subosito/flutter-action@v2
-        with:
-          channel: 'stable'
-          cache: true # Caches Flutter dependencies to speed up future runs
-
-      - name: Install dependencies
-        run: flutter pub get
-
-      # This step compiles your app and generates the APK file
-      - name: Build Flutter APK
-        run: flutter build apk --debug
-
-      - name: Save APK as workflow artifact
-        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: ChatterBox-Android
-          # Flutter automatically saves the APK here by default
-          path: build/app/outputs/flutter-apk/app-debug.apk
-          if-no-files-found: error
-          retention-days: 30
+name: Package Android ap
  
 
 on:
