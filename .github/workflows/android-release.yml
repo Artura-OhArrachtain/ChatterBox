@@ -25,6 +25,45 @@ jobs:
         working-directory: client
         run: flutter pub get
 
+      - name: Validate release configuration
+        if: github.event_name == 'push'
+        env:
+          CHATTERBOX_API_URL: ${{ vars.CHATTERBOX_API_URL }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$CHATTERBOX_API_URL" || "$CHATTERBOX_API_URL" != https://* ]]; then
+            echo "Set CHATTERBOX_API_URL to the HTTPS URL of the deployed Go API."
+            exit 1
+          fi
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" ]]; then
+            echo "Set the Android signing secrets before publishing a versioned release."
+            exit 1
+          fi
+          if [[ -z "$ANDROID_KEY_ALIAS" || -z "$ANDROID_KEYSTORE_PASSWORD" || -z "$ANDROID_KEY_PASSWORD" ]]; then
+            echo "Set ANDROID_KEY_ALIAS, ANDROID_KEYSTORE_PASSWORD, and ANDROID_KEY_PASSWORD."
+            exit 1
+          fi
+
+      - name: Configure Android release signing
+        if: github.event_name == 'push'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          KEYSTORE_PATH="$RUNNER_TEMP/chatterbox-release.jks"
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          cat > client/android/key.properties <<EOF
+          storeFile=$KEYSTORE_PATH
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+
       - name: Build Android APK
         working-directory: client
         env:
@@ -44,16 +83,31 @@ jobs:
             --dart-define="CHATTERBOX_API=$CHATTERBOX_API_URL"
 
       - name: Prepare downloadable APK
+        env:
+          CHATTERBOX_API_URL: ${{ vars.CHATTERBOX_API_URL }}
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          BUILD_NUMBER: ${{ github.run_number }}
         run: |
           mkdir -p dist
           cp client/build/app/outputs/flutter-apk/app-release.apk dist/ChatterBox-Android.apk
+          if [[ "$RELEASE_EVENT" == "push" ]]; then
+            BUILD_NAME="${RELEASE_TAG#v}"
+            (cd client && flutter build appbundle --release \
+              --build-name="$BUILD_NAME" \
+              --build-number="$BUILD_NUMBER" \
+              --dart-define="CHATTERBOX_API=$CHATTERBOX_API_URL")
+            cp client/build/app/outputs/bundle/release/app-release.aab dist/ChatterBox-Android.aab
+          fi
 
       - name: Attach APK to GitHub Release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/ChatterBox-Android.apk
+          files: |
+            dist/ChatterBox-Android.apk
+            dist/ChatterBox-Android.aab
 
       - name: Save APK as workflow artifact
         if: github.event_name == 'workflow_dispatch'

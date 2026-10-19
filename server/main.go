@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -102,8 +103,12 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"name": "ChatterBox API", "health": "/health"})
 	})
-	log.Println("ChatterBox API listening on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", cors(mux)))
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	log.Printf("ChatterBox API listening on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, cors(mux)))
 }
 
 func (s *chatServer) handlePushRegistration(w http.ResponseWriter, r *http.Request) {

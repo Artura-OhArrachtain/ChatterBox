@@ -35,3 +35,17 @@ jobs:
         env:
           CHATTERBOX_API_URL: ${{ vars.CHATTERBOX_API_URL }}
         run: flutter build ios --release --no-codesign --dart-define="CHATTERBOX_API=$CHATTERBOX_API_URL"
+
+      - name: Archive unsigned iOS app
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            client/build/ios/iphoneos/Runner.app dist/ChatterBox-iOS-unsigned.zip
+
+      - name: Save unsigned iOS app as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatterBox-iOS-unsigned
+          path: dist/ChatterBox-iOS-unsigned.zip
+          if-no-files-found: error
+          retention-days: 30
