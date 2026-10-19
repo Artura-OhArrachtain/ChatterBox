@@ -6,31 +6,44 @@ ChatterBox is a Discord-inspired chat app with a Flutter client and a Go API. Th
 
 ### Android
 
-After the first versioned GitHub Release is published, download **ChatterBox-Android.apk** from the [latest releases](https://github.com/Artura-OhArrachtain/ChatterBox/releases/latest). On Android, open the APK and follow the install prompts. Android may ask you to allow installs from the browser or file manager you used.
+1. Open [ChatterBox latest releases](https://github.com/Artura-OhArrachtain/ChatterBox/releases/latest) on your Android phone.
+2. Under **Assets**, download **ChatterBox-Android.apk**.
+3. Open the downloaded APK and tap **Install**. If Android asks, allow your browser or file manager to install apps, then return to the APK and tap **Install** again.
 
-To create a release, push a version tag such as `v1.0.0`. GitHub Actions builds the APK and attaches it to the release:
+If there is no APK under **Assets** yet, a maintainer needs to publish the first release below.
 
-```sh
-git tag v1.0.0
-git push origin v1.0.0
-```
+### iPhone and iPad
 
-Before publishing, set the repository variable `CHATTERBOX_API_URL` to the deployed Go API’s public HTTPS URL. Create an Android signing keystore and keep a secure backup:
+Open the [ChatterBox install page](https://artura-oharrachtain.github.io/ChatterBox/downloads.html) in Safari, tap **Share**, then **Add to Home Screen**. This installs ChatterBox as a web app. A native iOS app requires Apple signing and distribution; the CI build in this repository is unsigned and cannot be installed directly.
+
+### Desktop and mobile web
+
+Open the [ChatterBox web app](https://artura-oharrachtain.github.io/ChatterBox/) in a browser. On supported mobile browsers, use the browser’s **Install app** or **Add to Home Screen** option. These links become available after the GitHub Pages workflow has published the site.
+
+### Publish the first Android download
+
+Complete these one-time steps as a repository maintainer:
+
+1. Deploy the Go API to Render using [`render.yaml`](render.yaml). Copy the API’s public HTTPS URL.
+2. In the GitHub repository, open **Settings → Secrets and variables → Actions**. Add repository variable `CHATTERBOX_API_URL` with the API URL.
+3. Create an Android signing key and store a secure backup of `chatterbox-release.jks`:
 
 ```sh
 keytool -genkeypair -v -keystore chatterbox-release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias chatterbox
 base64 < chatterbox-release.jks | tr -d '\n'
 ```
 
-Add the encoded output and keystore values as repository Actions secrets: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEYSTORE_PASSWORD`, and `ANDROID_KEY_PASSWORD`. Future Android updates must use the same key. A versioned release includes an APK for direct installation and an Android App Bundle for Google Play.
+4. Add the base64 output as secret `ANDROID_KEYSTORE_BASE64`. Add the alias as `ANDROID_KEY_ALIAS`, and the key/store passwords as `ANDROID_KEY_PASSWORD` and `ANDROID_KEYSTORE_PASSWORD`.
+5. Push a new version tag from the repository root. The tag version should match the app version in `client/pubspec.yaml` (without the leading `v`):
 
-### iPhone and iPad
+```sh
+git tag v1.0.0
+git push origin v1.0.0
+```
 
-The web app can be added to the Home Screen from Safari: open the published site, tap **Share**, then **Add to Home Screen**. Installing a native iOS app requires an Apple-signed build and distribution through Apple’s supported channels. The iOS workflow saves an unsigned app artifact for CI; it is not directly installable on an iPhone.
+6. Wait for the **Package Android app** workflow to finish. It creates a GitHub Release containing **ChatterBox-Android.apk** for direct installation and **ChatterBox-Android.aab** for Google Play. Future updates must be signed with the same keystore.
 
-### Web
-
-The GitHub Pages workflow publishes the web client when changes are pushed to `main`. Enable **Settings → Pages → Build and deployment → GitHub Actions** in the repository. The app is served from the project’s Pages URL; a separate install page is available at `/downloads.html`.
+To publish the web install page, enable **Settings → Pages → Build and deployment → GitHub Actions**. The Pages workflow deploys the site after pushes to `main`; first publication may take a few minutes.
 
 ## Run locally
 
