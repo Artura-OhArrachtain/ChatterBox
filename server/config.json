@@ -1,0 +1,14 @@
+{
+  "servers": [
+    { "id": "hangout", "name": "The Hangout" },
+    { "id": "test", "name": "Test Server" }
+  ],
+  "rooms": [
+    { "id": "general", "name": "general", "serverId": "hangout" },
+    { "id": "introductions", "name": "introductions", "serverId": "hangout" },
+    { "id": "random", "name": "random", "serverId": "hangout" },
+    { "id": "test-general", "name": "general", "serverId": "test" },
+    { "id": "test-projects", "name": "projects", "serverId": "test" },
+    { "id": "test-random", "name": "random", "serverId": "test" }
+  ]
+}

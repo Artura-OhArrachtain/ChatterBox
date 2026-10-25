@@ -77,6 +77,16 @@ For a production web or mobile build, set `CHATTERBOX_API_URL` as a GitHub Actio
 
 The Go API currently keeps chat messages, rooms, and call signaling in memory, so they reset when the server restarts. It is a demo backend and does not provide persistent storage or user authentication. For push notifications, configure Firebase for the Android/iOS apps and give the Go API Firebase Application Default Credentials. See [PUSH_NOTIFICATIONS.md](PUSH_NOTIFICATIONS.md) for setup. Never put Firebase service-account credentials in the client app.
 
+### Add chat servers and rooms
+
+Edit [`server/config.json`](server/config.json) to add or rename servers and their rooms. Each server needs a unique `id` and a display `name`. Each room needs a unique `id`, a display `name`, and a `serverId` that matches one of the server IDs. Use lowercase IDs with hyphens, for example:
+
+```json
+{ "id": "book-club", "name": "Book Club", "serverId": "hangout" }
+```
+
+The API reads this file at startup from the repository root. To use another file, set `CHATTERBOX_SERVER_CONFIG` to its path. Restart or redeploy the API after editing the config. Room IDs also identify message history, so keep existing IDs if you want existing messages to stay associated with the same rooms.
+
 ### Deploy the Go API to Render
 
 The root [`render.yaml`](render.yaml) defines a Render web service for the Go API. In Render, create a **Blueprint** from this GitHub repository and deploy the `chatterbox-api` service. Render builds the Go server, starts it on Render’s assigned `PORT`, and checks `/health`. After deployment, set the GitHub Actions repository variable `CHATTERBOX_API_URL` to the service’s HTTPS URL so the web and mobile release workflows point clients to that API.

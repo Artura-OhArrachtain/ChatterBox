@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -24,6 +25,11 @@ type Room struct {
 type Server struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+type serverConfig struct {
+	Servers []Server `json:"servers"`
+	Rooms   []Room   `json:"rooms"`
 }
 
 type Message struct {
@@ -60,6 +66,10 @@ type chatServer struct {
 }
 
 func main() {
+	config, err := loadServerConfig()
+	if err != nil {
+		log.Fatalf("load server config: %v", err)
+	}
 	var fcm *messaging.Client
 	if app, err := firebase.NewApp(context.Background(), nil); err != nil {
 		log.Printf("FCM disabled: initialize Firebase Admin SDK: %v", err)
@@ -70,12 +80,8 @@ func main() {
 		log.Println("FCM delivery is disabled; configure Application Default Credentials for the Firebase project")
 	}
 	s := &chatServer{
-		servers: []Server{{"hangout", "The Hangout"}, {"test", "Test Server"}},
-		rooms: []Room{
-			{"general", "general", "hangout"}, {"introductions", "introductions", "hangout"}, {"random", "random", "hangout"},
-			{"test-general", "general", "test"}, {"test-projects", "projects", "test"}, {"test-random", "random", "test"},
-			{"dm-maya", "Maya Chen", "direct"}, {"dm-leo", "Leo Park", "direct"}, {"dm-sam", "Sam Rivera", "direct"},
-		},
+		servers: config.Servers,
+		rooms:   config.Rooms,
 		messages: []Message{
 			{1, "general", "Maya", "Welcome to ChatterBox! This is your space to hang out.", time.Now().Add(-35 * time.Minute)},
 			{2, "general", "Leo", "A simple chat app, ready for your ideas ✨", time.Now().Add(-32 * time.Minute)},
@@ -109,6 +115,44 @@ func main() {
 	}
 	log.Printf("ChatterBox API listening on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, cors(mux)))
+}
+
+func loadServerConfig() (serverConfig, error) {
+	path := os.Getenv("CHATTERBOX_SERVER_CONFIG")
+	if path == "" {
+		path = "server/config.json"
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return serverConfig{}, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer file.Close()
+	var config serverConfig
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&config); err != nil {
+		return serverConfig{}, fmt.Errorf("decode %s: %w", path, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return serverConfig{}, fmt.Errorf("%s must contain one JSON value", path)
+	}
+	if len(config.Servers) == 0 || len(config.Rooms) == 0 {
+		return serverConfig{}, fmt.Errorf("%s must define at least one server and one room", path)
+	}
+	serverIDs, roomIDs := map[string]bool{}, map[string]bool{}
+	for _, server := range config.Servers {
+		if strings.TrimSpace(server.ID) == "" || strings.TrimSpace(server.Name) == "" || serverIDs[server.ID] {
+			return serverConfig{}, fmt.Errorf("%s has an empty or duplicate server id/name", path)
+		}
+		serverIDs[server.ID] = true
+	}
+	for _, room := range config.Rooms {
+		if strings.TrimSpace(room.ID) == "" || strings.TrimSpace(room.Name) == "" || roomIDs[room.ID] || !serverIDs[room.ServerID] {
+			return serverConfig{}, fmt.Errorf("%s has an empty/duplicate room or a room with unknown serverId", path)
+		}
+		roomIDs[room.ID] = true
+	}
+	return config, nil
 }
 
 func (s *chatServer) handlePushRegistration(w http.ResponseWriter, r *http.Request) {
