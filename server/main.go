@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,9 @@ type Message struct {
 	Content   string    `json:"content"`
 	CreatedAt time.Time `json:"createdAt"`
 }
+
+// Direct-message conversations are not configured rooms; the client addresses them as dm-<contactId>.
+var directMessageID = regexp.MustCompile(`^dm-[a-z0-9-]{1,64}$`)
 
 type CallSignal struct {
 	ID        int64     `json:"id"`
@@ -354,7 +358,7 @@ func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	validRoom := false
+	validRoom := directMessageID.MatchString(input.RoomID)
 	for _, room := range s.rooms {
 		if room.ID == input.RoomID {
 			validRoom = true
