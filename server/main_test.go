@@ -190,8 +190,14 @@ func TestHandleMessagesPostValidation(t *testing.T) {
 		{"missing author", `{"roomId":"general","content":"c"}`, http.StatusBadRequest},
 		{"whitespace content", `{"roomId":"general","author":"a","content":"   "}`, http.StatusBadRequest},
 		{"unknown room", `{"roomId":"nope","author":"a","content":"c"}`, http.StatusNotFound},
-		// Seeded DM conversations are not rooms in config.json, so posting to them is rejected.
-		{"dm conversation", `{"roomId":"dm-maya","author":"You","content":"hi"}`, http.StatusNotFound},
+		// DM conversations are not configured rooms but are addressed as dm-<contactId>.
+		{"dm conversation", `{"roomId":"dm-maya","author":"You","content":"hi"}`, http.StatusCreated},
+		{"dm hyphenated id", `{"roomId":"dm-maya-chen-2","author":"You","content":"hi"}`, http.StatusCreated},
+		{"dm empty id", `{"roomId":"dm-","author":"You","content":"hi"}`, http.StatusNotFound},
+		{"dm path traversal", `{"roomId":"dm-../x","author":"You","content":"hi"}`, http.StatusNotFound},
+		{"dm uppercase", `{"roomId":"dm-Maya","author":"You","content":"hi"}`, http.StatusNotFound},
+		{"dm id too long", fmt.Sprintf(`{"roomId":"dm-%s","author":"You","content":"hi"}`, strings.Repeat("a", 65)), http.StatusNotFound},
+		{"dm prefix only in middle", `{"roomId":"xdm-maya","author":"You","content":"hi"}`, http.StatusNotFound},
 		{"2000 chars", fmt.Sprintf(`{"roomId":"general","author":"a","content":%q}`, strings.Repeat("x", 2000)), http.StatusCreated},
 		{"2001 chars", fmt.Sprintf(`{"roomId":"general","author":"a","content":%q}`, strings.Repeat("x", 2001)), http.StatusBadRequest},
 		{"body over 16KiB", fmt.Sprintf(`{"roomId":"general","author":"a","content":%q}`, strings.Repeat("x", 17*1024)), http.StatusBadRequest},

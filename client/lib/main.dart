@@ -521,6 +521,11 @@ class _ChatHomeState extends State<ChatHome> {
       if (response.statusCode < 300) {
         _input.clear();
         await _refresh();
+      } else if (mounted) {
+        final reason = response.body.trim();
+        _snack(reason.isEmpty
+            ? 'Message not sent (error ${response.statusCode}).'
+            : 'Message not sent: $reason');
       }
     } catch (_) {
       if (mounted) _snack('Can’t reach the chat server.');
