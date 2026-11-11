@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: chatterbox-api
+    runtime: go
+    plan: free
+    buildCommand: go build -tags netgo -ldflags '-s -w' -o server/chatterbox-server ./server
+    startCommand: ./server/chatterbox-server
+    healthCheckPath: /health
+    autoDeploy: true
