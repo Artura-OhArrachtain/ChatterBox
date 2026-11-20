@@ -33,9 +33,10 @@ type serverConfig struct {
 }
 
 type Message struct {
-	ID        int64     `json:"id"`
+	ID        string    `json:"id"`
 	RoomID    string    `json:"roomId"`
 	Author    string    `json:"author"`
+	AuthorID  string    `json:"authorId"`
 	Content   string    `json:"content"`
 	CreatedAt time.Time `json:"createdAt"`
 }
@@ -57,12 +58,13 @@ type chatServer struct {
 	mu           sync.RWMutex
 	servers      []Server
 	rooms        []Room
-	messages     []Message
-	nextID       int64
 	signals      []CallSignal
 	nextSignalID int64
 	pushTokens   map[string]string
 	fcm          *messaging.Client
+	profiles     ProfileRepository
+	dms          DMRepository
+	messages     MessageRepository
 }
 
 func main() {
@@ -70,10 +72,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("load server config: %v", err)
 	}
+	var firebaseConfig *firebase.Config
+	if projectID := strings.TrimSpace(os.Getenv("FIREBASE_PROJECT_ID")); projectID != "" {
+		firebaseConfig = &firebase.Config{ProjectID: projectID}
+	}
+	app, err := firebase.NewApp(context.Background(), firebaseConfig)
+	if err != nil {
+		log.Fatalf("initialize Firebase Admin SDK: %v", err)
+	}
+	authClient, err := app.Auth(context.Background())
+	if err != nil {
+		log.Fatalf("initialize Firebase Auth: %v", err)
+	}
+	firestoreClient, err := app.Firestore(context.Background())
+	if err != nil {
+		log.Fatalf("initialize Firestore: %v", err)
+	}
+	defer firestoreClient.Close()
+	repositories := NewFirestoreRepositories(firestoreClient)
 	var fcm *messaging.Client
-	if app, err := firebase.NewApp(context.Background(), nil); err != nil {
-		log.Printf("FCM disabled: initialize Firebase Admin SDK: %v", err)
-	} else if fcm, err = app.Messaging(context.Background()); err != nil {
+	if fcm, err = app.Messaging(context.Background()); err != nil {
 		log.Printf("FCM disabled: create messaging client: %v", err)
 	}
 	if fcm == nil {
@@ -82,23 +100,34 @@ func main() {
 	s := &chatServer{
 		servers: config.Servers,
 		rooms:   config.Rooms,
-		messages: []Message{
-			{1, "general", "Maya", "Welcome to ChatterBox! This is your space to hang out.", time.Now().Add(-35 * time.Minute)},
-			{2, "general", "Leo", "A simple chat app, ready for your ideas ✨", time.Now().Add(-32 * time.Minute)},
-			{3, "general", "Maya", "Pick a channel on the left and say hello.", time.Now().Add(-29 * time.Minute)},
-			{4, "test-general", "Riley", "Welcome to the Test Server! Try chatting here.", time.Now().Add(-12 * time.Minute)},
-			{5, "test-projects", "Sam", "Use this channel to share what you’re building.", time.Now().Add(-8 * time.Minute)},
-			{6, "dm-maya", "Maya Chen", "Hey! Welcome to ChatterBox. 👋", time.Now().Add(-18 * time.Minute)},
-			{7, "dm-maya", "You", "Thanks, glad to be here!", time.Now().Add(-16 * time.Minute)},
-			{8, "dm-leo", "Leo Park", "Want to try the voice channels later?", time.Now().Add(-9 * time.Minute)},
-		}, nextID: 9, nextSignalID: 1, pushTokens: make(map[string]string), fcm: fcm,
+		signals: []CallSignal{}, nextSignalID: 1, pushTokens: make(map[string]string),
+		fcm: fcm, profiles: repositories, dms: repositories, messages: NewFirestoreMessageRepository(firestoreClient),
 	}
+	handler := newHTTPHandler(s, firebaseIDTokenVerifier{client: authClient})
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	log.Printf("ChatterBox API listening on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, handler))
+}
+
+func newHTTPHandler(s *chatServer, verifier IDTokenVerifier) http.Handler {
+	return newHTTPHandlerWithRepositories(s, verifier, s.profiles, s.dms, s.messages)
+}
+
+func newHTTPHandlerWithRepositories(s *chatServer, verifier IDTokenVerifier, profiles ProfileRepository, dms DMRepository, messages MessageRepository) http.Handler {
+	authenticate := firebaseIDTokenMiddleware(verifier)
+	s.profiles, s.dms, s.messages = profiles, dms, messages
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/servers", s.handleServers)
-	mux.HandleFunc("/api/rooms", s.handleRooms)
-	mux.HandleFunc("/api/messages", s.handleMessages)
-	mux.HandleFunc("/api/push/register", s.handlePushRegistration)
-	mux.HandleFunc("/api/calls/signals", s.handleCallSignals)
+	mux.Handle("/api/servers", authenticate(http.HandlerFunc(s.handleServers)))
+	mux.Handle("/api/rooms", authenticate(http.HandlerFunc(s.handleRooms)))
+	mux.Handle("/api/messages", authenticate(http.HandlerFunc(s.handleMessages)))
+	mux.Handle("/api/me", authenticate(http.HandlerFunc(s.handleMe)))
+	mux.Handle("/api/users", authenticate(http.HandlerFunc(s.handleUsers)))
+	mux.Handle("/api/dms", authenticate(http.HandlerFunc(s.handleDMs)))
+	mux.Handle("/api/push/register", authenticate(http.HandlerFunc(s.handlePushRegistration)))
+	mux.Handle("/api/calls/signals", authenticate(http.HandlerFunc(s.handleCallSignals)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -109,12 +138,7 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"name": "ChatterBox API", "health": "/health"})
 	})
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	log.Printf("ChatterBox API listening on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, cors(mux)))
+	return cors(mux)
 }
 
 func loadServerConfig() (serverConfig, error) {
@@ -218,10 +242,20 @@ func (s *chatServer) handleCallSignals(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	identity, _ := UserIdentityFromContext(r.Context())
 	if r.Method == http.MethodGet {
-		roomID, peerID := r.URL.Query().Get("room"), r.URL.Query().Get("peer")
-		if roomID == "" || peerID == "" {
-			http.Error(w, "room and peer are required", http.StatusBadRequest)
+		roomID := r.URL.Query().Get("room")
+		if roomID == "" {
+			http.Error(w, "room is required", http.StatusBadRequest)
+			return
+		}
+		allowed, err := s.roomAllowed(r.Context(), roomID, identity.UID)
+		if err != nil {
+			http.Error(w, "could not verify conversation membership", http.StatusInternalServerError)
+			return
+		}
+		if !allowed {
+			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		var after int64
@@ -232,7 +266,7 @@ func (s *chatServer) handleCallSignals(w http.ResponseWriter, r *http.Request) {
 		defer s.mu.RUnlock()
 		result := make([]CallSignal, 0)
 		for _, signal := range s.signals {
-			if signal.ID > after && signal.RoomID == roomID && signal.From != peerID && (signal.To == "" || signal.To == peerID) {
+			if signal.ID > after && signal.RoomID == roomID && signal.From != identity.UID && (signal.To == "" || signal.To == identity.UID) {
 				result = append(result, signal)
 			}
 		}
@@ -248,9 +282,19 @@ func (s *chatServer) handleCallSignals(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	signal.RoomID, signal.From, signal.To, signal.Type = strings.TrimSpace(signal.RoomID), strings.TrimSpace(signal.From), strings.TrimSpace(signal.To), strings.TrimSpace(signal.Type)
+	signal.RoomID, signal.To, signal.Type = strings.TrimSpace(signal.RoomID), strings.TrimSpace(signal.To), strings.TrimSpace(signal.Type)
+	signal.From = identity.UID
 	if signal.RoomID == "" || signal.From == "" || signal.Type == "" {
-		http.Error(w, "roomId, from, and type are required", http.StatusBadRequest)
+		http.Error(w, "roomId and type are required", http.StatusBadRequest)
+		return
+	}
+	allowed, err := s.roomAllowed(r.Context(), signal.RoomID, identity.UID)
+	if err != nil {
+		http.Error(w, "could not verify conversation membership", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	switch signal.Type {
@@ -309,24 +353,227 @@ func (s *chatServer) handleServers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.servers)
 }
 
+func (s *chatServer) roomAllowed(ctx context.Context, roomID, uid string) (bool, error) {
+	for _, room := range s.rooms {
+		if room.ID == roomID {
+			return true, nil
+		}
+	}
+	if s.dms == nil {
+		return false, nil
+	}
+	return s.dms.IsParticipant(ctx, roomID, uid)
+}
+
+func (s *chatServer) handleMe(w http.ResponseWriter, r *http.Request) {
+	identity, _ := UserIdentityFromContext(r.Context())
+	switch r.Method {
+	case http.MethodOptions:
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodGet:
+		if s.profiles == nil {
+			http.Error(w, "profile storage unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		profile, err := s.profiles.Get(r.Context(), identity.UID)
+		if err != nil {
+			http.Error(w, "could not load profile", http.StatusInternalServerError)
+			return
+		}
+		if profile == nil {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, profile.Public())
+	case http.MethodPut:
+		var input struct {
+			DisplayName string `json:"displayName"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		input.DisplayName = strings.TrimSpace(input.DisplayName)
+		if len(input.DisplayName) < 1 || len([]rune(input.DisplayName)) > 40 {
+			http.Error(w, "displayName must be 1 to 40 characters", http.StatusBadRequest)
+			return
+		}
+		if s.profiles == nil {
+			http.Error(w, "profile storage unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		profile := Profile{UID: identity.UID, Email: identity.Email, DisplayName: input.DisplayName, Verified: identity.EmailVerified}
+		if err := s.profiles.Put(r.Context(), profile); err != nil {
+			http.Error(w, "could not save profile", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, profile.Public())
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *chatServer) handleUsers(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("query"))
+	if len([]rune(query)) > 40 {
+		http.Error(w, "query is too long", http.StatusBadRequest)
+		return
+	}
+	if len([]rune(query)) < 2 {
+		http.Error(w, "query must be at least 2 characters", http.StatusBadRequest)
+		return
+	}
+	if s.profiles == nil {
+		writeJSON(w, http.StatusOK, []ProfileSummary{})
+		return
+	}
+	profiles, err := s.profiles.SearchPrefix(r.Context(), query, 20)
+	if err != nil {
+		http.Error(w, "could not search profiles", http.StatusInternalServerError)
+		return
+	}
+	identity, _ := UserIdentityFromContext(r.Context())
+	result := make([]ProfileSummary, 0, len(profiles))
+	for _, profile := range profiles {
+		if profile.UID != identity.UID {
+			result = append(result, profile)
+		}
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *chatServer) handleDMs(w http.ResponseWriter, r *http.Request) {
+	identity, _ := UserIdentityFromContext(r.Context())
+	switch r.Method {
+	case http.MethodOptions:
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodGet:
+		if s.dms == nil {
+			writeJSON(w, http.StatusOK, []ConversationResponse{})
+			return
+		}
+		conversations, err := s.dms.List(r.Context(), identity.UID)
+		if err != nil {
+			http.Error(w, "could not load conversations", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, s.conversationResponses(r, conversations))
+	case http.MethodPost:
+		var input struct {
+			UserID string `json:"userId"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		input.UserID = strings.TrimSpace(input.UserID)
+		if input.UserID == "" {
+			http.Error(w, "userId is required", http.StatusBadRequest)
+			return
+		}
+		if input.UserID == identity.UID {
+			http.Error(w, "cannot create a DM with yourself", http.StatusBadRequest)
+			return
+		}
+		if s.profiles == nil {
+			http.Error(w, "profile storage unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		target, err := s.profiles.Get(r.Context(), input.UserID)
+		if err != nil {
+			http.Error(w, "could not load target profile", http.StatusInternalServerError)
+			return
+		}
+		if target == nil || !target.Verified {
+			http.Error(w, "target profile not found", http.StatusNotFound)
+			return
+		}
+		if s.dms == nil {
+			http.Error(w, "conversation storage unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		conversation, err := s.dms.CreateOrGet(r.Context(), identity.UID, input.UserID)
+		if err != nil {
+			http.Error(w, "could not create conversation", http.StatusInternalServerError)
+			return
+		}
+		responses := s.conversationResponses(r, []Conversation{conversation})
+		writeJSON(w, http.StatusCreated, responses[0])
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+type ConversationResponse struct {
+	ID               string    `json:"id"`
+	ParticipantIDs   []string  `json:"participantIds"`
+	OtherUserID      string    `json:"otherUserId"`
+	OtherDisplayName string    `json:"otherDisplayName"`
+	CreatedAt        time.Time `json:"createdAt"`
+}
+
+func (s *chatServer) conversationResponses(r *http.Request, conversations []Conversation) []ConversationResponse {
+	identity, _ := UserIdentityFromContext(r.Context())
+	result := make([]ConversationResponse, 0, len(conversations))
+	for _, conversation := range conversations {
+		other := ""
+		for _, uid := range conversation.ParticipantIDs {
+			if uid != identity.UID {
+				other = uid
+				break
+			}
+		}
+		displayName := ""
+		if s.profiles != nil && other != "" {
+			if profile, err := s.profiles.Get(r.Context(), other); err == nil && profile != nil {
+				displayName = profile.DisplayName
+			}
+		}
+		result = append(result, ConversationResponse{
+			ID: conversation.ID, ParticipantIDs: append([]string(nil), conversation.ParticipantIDs...),
+			OtherUserID: other, OtherDisplayName: displayName, CreatedAt: conversation.CreatedAt,
+		})
+	}
+	return result
+}
+
 func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	identity, _ := UserIdentityFromContext(r.Context())
 	if r.Method == http.MethodGet {
 		roomID := r.URL.Query().Get("room")
 		if roomID == "" {
 			http.Error(w, "room is required", http.StatusBadRequest)
 			return
 		}
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		result := make([]Message, 0)
-		for _, msg := range s.messages {
-			if msg.RoomID == roomID {
-				result = append(result, msg)
-			}
+		allowed, err := s.roomAllowed(r.Context(), roomID, identity.UID)
+		if err != nil {
+			http.Error(w, "could not verify conversation membership", http.StatusInternalServerError)
+			return
+		}
+		if !allowed {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if s.messages == nil {
+			writeJSON(w, http.StatusOK, []Message{})
+			return
+		}
+		result, err := s.messages.List(r.Context(), roomID, 200)
+		if err != nil {
+			http.Error(w, "could not load messages", http.StatusInternalServerError)
+			return
 		}
 		writeJSON(w, http.StatusOK, result)
 		return
@@ -337,44 +584,53 @@ func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	var input struct {
 		RoomID  string `json:"roomId"`
-		Author  string `json:"author"`
 		Content string `json:"content"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&input); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	input.RoomID, input.Author, input.Content = strings.TrimSpace(input.RoomID), strings.TrimSpace(input.Author), strings.TrimSpace(input.Content)
-	if input.RoomID == "" || input.Author == "" || input.Content == "" {
-		http.Error(w, "roomId, author, and content are required", http.StatusBadRequest)
+	input.RoomID, input.Content = strings.TrimSpace(input.RoomID), strings.TrimSpace(input.Content)
+	if input.RoomID == "" || input.Content == "" {
+		http.Error(w, "roomId and content are required", http.StatusBadRequest)
 		return
 	}
 	if len(input.Content) > 2000 {
 		http.Error(w, "message must be 2000 characters or fewer", http.StatusBadRequest)
 		return
 	}
-	s.mu.Lock()
-	validRoom := false
-	for _, room := range s.rooms {
-		if room.ID == input.RoomID {
-			validRoom = true
-			break
-		}
-	}
-	// Direct messages use this endpoint too, but their IDs are contact-based
-	// (for example, "dm-maya") and are not part of the room configuration.
-	if strings.HasPrefix(input.RoomID, "dm-") && len(strings.TrimPrefix(input.RoomID, "dm-")) > 0 {
-		validRoom = true
-	}
-	if !validRoom {
-		s.mu.Unlock()
-		http.Error(w, "room not found", http.StatusNotFound)
+	allowed, err := s.roomAllowed(r.Context(), input.RoomID, identity.UID)
+	if err != nil {
+		http.Error(w, "could not verify conversation membership", http.StatusInternalServerError)
 		return
 	}
-	msg := Message{s.nextID, input.RoomID, input.Author, input.Content, time.Now().UTC()}
-	s.nextID++
-	s.messages = append(s.messages, msg)
-	s.mu.Unlock()
+	if !allowed {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if s.profiles == nil {
+		http.Error(w, "profile required", http.StatusForbidden)
+		return
+	}
+	profile, err := s.profiles.Get(r.Context(), identity.UID)
+	if err != nil {
+		http.Error(w, "could not load profile", http.StatusInternalServerError)
+		return
+	}
+	if profile == nil {
+		http.Error(w, "profile required", http.StatusForbidden)
+		return
+	}
+	if s.messages == nil {
+		http.Error(w, "message storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	msg := Message{RoomID: input.RoomID, Author: profile.DisplayName, AuthorID: identity.UID, Content: input.Content, CreatedAt: time.Now().UTC()}
+	msg, err = s.messages.Append(r.Context(), msg)
+	if err != nil {
+		http.Error(w, "could not save message", http.StatusInternalServerError)
+		return
+	}
 	go s.notifyOtherDevices(msg)
 	writeJSON(w, http.StatusCreated, msg)
 }
@@ -382,8 +638,8 @@ func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -395,6 +651,6 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func methodNotAllowed(w http.ResponseWriter) {
-	w.Header().Set("Allow", strings.Join([]string{http.MethodGet, http.MethodPost, http.MethodOptions}, ", "))
+	w.Header().Set("Allow", strings.Join([]string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodOptions}, ", "))
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }

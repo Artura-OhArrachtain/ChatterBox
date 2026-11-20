@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -10,8 +11,10 @@ import 'package:http/http.dart' as http;
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'auth_gate.dart';
 import 'call_screen.dart';
 import 'call_session.dart';
+import 'firebase_config.dart';
 
 const ink = Color(0xFF111318);
 const panel = Color(0xFF191B22);
@@ -39,11 +42,30 @@ extension ColorVisionModeLabel on ColorVisionMode {
       };
 }
 
-void main() => runApp(const ChatterBoxApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final options = firebaseOptionsForCurrentPlatform();
+  String? firebaseError;
+  if (options == null) {
+    firebaseError = firebaseConfigurationHelp();
+  } else {
+    try {
+      await Firebase.initializeApp(options: options);
+    } catch (error) {
+      firebaseError = 'Could not initialize Firebase: $error';
+    }
+  }
+  runApp(ChatterBoxApp(firebaseError: firebaseError));
+}
 
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  await Firebase.initializeApp();
+  if (Firebase.apps.isNotEmpty) return;
+  final options = firebaseOptionsForCurrentPlatform();
+  if (options == null) {
+    throw StateError(firebaseConfigurationHelp());
+  }
+  await Firebase.initializeApp(options: options);
 }
 
 class ChatRoom {
@@ -96,7 +118,10 @@ class ChatMessage {
 }
 
 class ChatterBoxApp extends StatelessWidget {
-  const ChatterBoxApp({super.key});
+  const ChatterBoxApp({super.key, this.firebaseError});
+
+  final String? firebaseError;
+
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'ChatterBox',
@@ -108,12 +133,18 @@ class ChatterBoxApp extends StatelessWidget {
             colorScheme:
                 const ColorScheme.dark(primary: accent, surface: panel),
             fontFamily: 'Roboto'),
-        home: const ChatHome(),
+        home: AuthGate(
+          configurationError: firebaseError,
+          authenticatedAppBuilder: (user) => ChatHome(user: user),
+        ),
       );
 }
 
 class ChatHome extends StatefulWidget {
-  const ChatHome({super.key});
+  const ChatHome({super.key, required this.user});
+
+  final User user;
+
   @override
   State<ChatHome> createState() => _ChatHomeState();
 }
@@ -354,8 +385,9 @@ class _ChatHomeState extends State<ChatHome> {
 
   Future<void> _refresh() async {
     try {
+      final headers = await apiAuthHeaders();
       final serversResponse = await http
-          .get(Uri.parse('$_apiBase/api/servers'))
+          .get(Uri.parse('$_apiBase/api/servers'), headers: headers)
           .timeout(const Duration(seconds: 3));
       if (serversResponse.statusCode == 200) {
         final servers = (jsonDecode(serversResponse.body) as List)
@@ -369,7 +401,8 @@ class _ChatHomeState extends State<ChatHome> {
         }
       }
       final roomsResponse = await http
-          .get(Uri.parse('$_apiBase/api/rooms?server=$_serverId'))
+          .get(Uri.parse('$_apiBase/api/rooms?server=$_serverId'),
+              headers: headers)
           .timeout(const Duration(seconds: 3));
       if (roomsResponse.statusCode != 200)
         throw Exception('Could not load rooms');
@@ -380,7 +413,8 @@ class _ChatHomeState extends State<ChatHome> {
           rooms.any((r) => r.id == _roomId) ? _roomId : rooms.first.id;
       final roomWasRestored = selected != _roomId;
       final messageResponse = await http
-          .get(Uri.parse('$_apiBase/api/messages?room=$_conversationId'))
+          .get(Uri.parse('$_apiBase/api/messages?room=$_conversationId'),
+              headers: headers)
           .timeout(const Duration(seconds: 3));
       if (messageResponse.statusCode != 200)
         throw Exception('Could not load messages');
@@ -511,10 +545,9 @@ class _ChatHomeState extends State<ChatHome> {
     try {
       final response = await http
           .post(Uri.parse('$_apiBase/api/messages'),
-              headers: {'Content-Type': 'application/json'},
+              headers: await apiAuthHeaders(jsonBody: true),
               body: jsonEncode({
                 'roomId': _conversationId,
-                'author': _profileName,
                 'content': content
               }))
           .timeout(const Duration(seconds: 5));
@@ -865,6 +898,12 @@ class _ChatHomeState extends State<ChatHome> {
                         ])),
                     actions: [
                       TextButton(
+                          onPressed: () async {
+                            Navigator.pop(dialogContext);
+                            await FirebaseAuth.instance.signOut();
+                          },
+                          child: const Text('Sign out')),
+                      TextButton(
                           onPressed: () => Navigator.pop(dialogContext),
                           child: const Text('Cancel')),
                       FilledButton(
@@ -915,7 +954,10 @@ class _ChatHomeState extends State<ChatHome> {
       _echoCancellation = prefs.getBool('echoCancellation') ?? true;
       _autoGainControl = prefs.getBool('autoGainControl') ?? true;
       _microphoneGain = prefs.getDouble('microphoneGain') ?? 1;
-      _profileName = prefs.getString('profileName') ?? 'You';
+      _profileName = prefs.getString('profileName') ??
+          widget.user.displayName ??
+          widget.user.email?.split('@').first ??
+          'Member';
       _profileStatus = prefs.getString('profileStatus') ?? 'Online';
       _profileColorValue = prefs.getInt('profileColor') ?? 0xFFB478D3;
       _favoriteContactIds =

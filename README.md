@@ -51,6 +51,16 @@ To publish the web install page, enable **Settings → Pages → Build and deplo
 
 Requirements: [Flutter](https://docs.flutter.dev/get-started/install) (stable), [Go](https://go.dev/dl/) 1.22 or later, and Git.
 
+If Flutter is already available in this workspace at `.deps/flutter`, add its SDK and package cache before running the commands below. The Git settings trust only that local SDK checkout for this shell, which may be needed when the workspace is on a shared mount:
+
+```sh
+export PATH="$PWD/.deps/flutter/bin:$PATH"
+export PUB_CACHE="$PWD/.deps/pub-cache"
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=safe.directory
+export GIT_CONFIG_VALUE_0="$PWD/.deps/flutter"
+```
+
 Start the Go API in one terminal:
 
 ```sh
@@ -69,6 +79,12 @@ To run the web client with the local API, use:
 
 ```sh
 flutter run -d chrome --dart-define=CHATTERBOX_API=http://localhost:8080
+```
+
+If Chrome is not installed, run the web-server device instead and open the printed URL in a browser:
+
+```sh
+flutter run -d web-server --web-port=8081 --dart-define=CHATTERBOX_API=http://localhost:8080
 ```
 
 For a production web or mobile build, set `CHATTERBOX_API_URL` as a GitHub Actions repository variable. The workflows pass it to Flutter as `CHATTERBOX_API`. The API must be reachable by the device/browser; on a physical phone, `localhost` means the phone itself, so use the development computer’s network address or a deployed API URL.
