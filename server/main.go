@@ -54,21 +54,37 @@ type CallSignal struct {
 }
 
 type chatServer struct {
+	db  *store
+	fcm *messaging.Client
+
+	// Call signaling is short-lived, so it stays in memory.
 	mu           sync.RWMutex
-	servers      []Server
-	rooms        []Room
-	messages     []Message
-	nextID       int64
 	signals      []CallSignal
 	nextSignalID int64
-	pushTokens   map[string]string
-	fcm          *messaging.Client
 }
 
 func main() {
 	config, err := loadServerConfig()
 	if err != nil {
 		log.Fatalf("load server config: %v", err)
+	}
+	dbPath := os.Getenv("CHATTERBOX_DB")
+	if dbPath == "" {
+		dbPath = "chatterbox.db"
+	}
+	db, err := openStore(dbPath)
+	if err != nil {
+		log.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	seeded, err := db.seedIfEmpty(config, welcomeMessages())
+	if err != nil {
+		log.Fatalf("seed database: %v", err)
+	}
+	if seeded {
+		log.Printf("initialized new database %s from server config", dbPath)
+	} else {
+		log.Printf("using existing database %s (server config is only read for a new database)", dbPath)
 	}
 	var fcm *messaging.Client
 	if app, err := firebase.NewApp(context.Background(), nil); err != nil {
@@ -79,27 +95,18 @@ func main() {
 	if fcm == nil {
 		log.Println("FCM delivery is disabled; configure Application Default Credentials for the Firebase project")
 	}
-	s := &chatServer{
-		servers: config.Servers,
-		rooms:   config.Rooms,
-		messages: []Message{
-			{1, "general", "Maya", "Welcome to ChatterBox! This is your space to hang out.", time.Now().Add(-35 * time.Minute)},
-			{2, "general", "Leo", "A simple chat app, ready for your ideas ✨", time.Now().Add(-32 * time.Minute)},
-			{3, "general", "Maya", "Pick a channel on the left and say hello.", time.Now().Add(-29 * time.Minute)},
-			{4, "test-general", "Riley", "Welcome to the Test Server! Try chatting here.", time.Now().Add(-12 * time.Minute)},
-			{5, "test-projects", "Sam", "Use this channel to share what you’re building.", time.Now().Add(-8 * time.Minute)},
-			{6, "dm-maya", "Maya Chen", "Hey! Welcome to ChatterBox. 👋", time.Now().Add(-18 * time.Minute)},
-			{7, "dm-maya", "You", "Thanks, glad to be here!", time.Now().Add(-16 * time.Minute)},
-			{8, "dm-leo", "Leo Park", "Want to try the voice channels later?", time.Now().Add(-9 * time.Minute)},
-		}, nextID: 9, nextSignalID: 1, pushTokens: make(map[string]string), fcm: fcm,
-	}
+	s := &chatServer{db: db, fcm: fcm, nextSignalID: 1}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/servers", s.handleServers)
 	mux.HandleFunc("/api/rooms", s.handleRooms)
 	mux.HandleFunc("/api/messages", s.handleMessages)
 	mux.HandleFunc("/api/push/register", s.handlePushRegistration)
 	mux.HandleFunc("/api/calls/signals", s.handleCallSignals)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if err := db.db.PingContext(r.Context()); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "database unavailable"})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +122,26 @@ func main() {
 	}
 	log.Printf("ChatterBox API listening on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, cors(mux)))
+}
+
+// welcomeMessages are inserted once, when a new database is created.
+func welcomeMessages() []Message {
+	at := func(minutesAgo int) time.Time { return time.Now().Add(-time.Duration(minutesAgo) * time.Minute) }
+	return []Message{
+		{RoomID: "general", Author: "Maya", Content: "Welcome to ChatterBox! This is your space to hang out.", CreatedAt: at(35)},
+		{RoomID: "general", Author: "Leo", Content: "A simple chat app, ready for your ideas ✨", CreatedAt: at(32)},
+		{RoomID: "general", Author: "Maya", Content: "Pick a channel on the left and say hello.", CreatedAt: at(29)},
+		{RoomID: "test-general", Author: "Riley", Content: "Welcome to the Test Server! Try chatting here.", CreatedAt: at(12)},
+		{RoomID: "test-projects", Author: "Sam", Content: "Use this channel to share what you’re building.", CreatedAt: at(8)},
+		{RoomID: "dm-maya", Author: "Maya Chen", Content: "Hey! Welcome to ChatterBox. 👋", CreatedAt: at(18)},
+		{RoomID: "dm-maya", Author: "You", Content: "Thanks, glad to be here!", CreatedAt: at(16)},
+		{RoomID: "dm-leo", Author: "Leo Park", Content: "Want to try the voice channels later?", CreatedAt: at(9)},
+	}
+}
+
+func internalError(w http.ResponseWriter, err error) {
+	log.Printf("internal error: %v", err)
+	http.Error(w, "internal server error", http.StatusInternalServerError)
 }
 
 func loadServerConfig() (serverConfig, error) {
@@ -177,9 +204,10 @@ func (s *chatServer) handlePushRegistration(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "token and user are required", http.StatusBadRequest)
 		return
 	}
-	s.mu.Lock()
-	s.pushTokens[input.Token] = input.User
-	s.mu.Unlock()
+	if err := s.db.savePushToken(input.Token, input.User); err != nil {
+		internalError(w, err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -187,20 +215,17 @@ func (s *chatServer) notifyOtherDevices(msg Message) {
 	if s.fcm == nil {
 		return
 	}
-	s.mu.RLock()
-	tokens := make([]string, 0, len(s.pushTokens))
-	for token, user := range s.pushTokens {
-		if user != msg.Author {
-			tokens = append(tokens, token)
-		}
+	tokens, err := s.db.pushTokensExcept(msg.Author)
+	if err != nil {
+		log.Printf("load push tokens: %v", err)
+		return
 	}
-	s.mu.RUnlock()
 	if len(tokens) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := s.fcm.SendEachForMulticast(ctx, &messaging.MulticastMessage{
+	resp, err := s.fcm.SendEachForMulticast(ctx, &messaging.MulticastMessage{
 		Tokens: tokens,
 		Notification: &messaging.Notification{
 			Title: msg.Author,
@@ -210,6 +235,16 @@ func (s *chatServer) notifyOtherDevices(msg Message) {
 	})
 	if err != nil {
 		log.Printf("push delivery failed: %v", err)
+		return
+	}
+	var stale []string
+	for i, r := range resp.Responses {
+		if r.Error != nil && messaging.IsUnregistered(r.Error) {
+			stale = append(stale, tokens[i])
+		}
+	}
+	if err := s.db.deletePushTokens(stale); err != nil {
+		log.Printf("delete stale push tokens: %v", err)
 	}
 }
 
@@ -279,20 +314,12 @@ func (s *chatServer) handleRooms(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	serverID := r.URL.Query().Get("server")
-	if serverID == "" {
-		writeJSON(w, http.StatusOK, s.rooms)
+	rooms, err := s.db.rooms(r.URL.Query().Get("server"))
+	if err != nil {
+		internalError(w, err)
 		return
 	}
-	result := make([]Room, 0)
-	for _, room := range s.rooms {
-		if room.ServerID == serverID {
-			result = append(result, room)
-		}
-	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, rooms)
 }
 
 func (s *chatServer) handleServers(w http.ResponseWriter, r *http.Request) {
@@ -304,9 +331,12 @@ func (s *chatServer) handleServers(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	writeJSON(w, http.StatusOK, s.servers)
+	servers, err := s.db.servers()
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, servers)
 }
 
 func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -320,15 +350,12 @@ func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "room is required", http.StatusBadRequest)
 			return
 		}
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		result := make([]Message, 0)
-		for _, msg := range s.messages {
-			if msg.RoomID == roomID {
-				result = append(result, msg)
-			}
+		messages, err := s.db.messages(roomID)
+		if err != nil {
+			internalError(w, err)
+			return
 		}
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, messages)
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -353,13 +380,10 @@ func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "message must be 2000 characters or fewer", http.StatusBadRequest)
 		return
 	}
-	s.mu.Lock()
-	validRoom := false
-	for _, room := range s.rooms {
-		if room.ID == input.RoomID {
-			validRoom = true
-			break
-		}
+	validRoom, err := s.db.roomExists(input.RoomID)
+	if err != nil {
+		internalError(w, err)
+		return
 	}
 	// Direct messages use this endpoint too, but their IDs are contact-based
 	// (for example, "dm-maya") and are not part of the room configuration.
@@ -367,14 +391,14 @@ func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 		validRoom = true
 	}
 	if !validRoom {
-		s.mu.Unlock()
 		http.Error(w, "room not found", http.StatusNotFound)
 		return
 	}
-	msg := Message{s.nextID, input.RoomID, input.Author, input.Content, time.Now().UTC()}
-	s.nextID++
-	s.messages = append(s.messages, msg)
-	s.mu.Unlock()
+	msg, err := s.db.addMessage(input.RoomID, input.Author, input.Content)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
 	go s.notifyOtherDevices(msg)
 	writeJSON(w, http.StatusCreated, msg)
 }

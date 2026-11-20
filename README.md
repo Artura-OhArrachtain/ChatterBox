@@ -75,7 +75,7 @@ For a production web or mobile build, set `CHATTERBOX_API_URL` as a GitHub Actio
 
 ## Backend and notifications
 
-The Go API currently keeps chat messages, rooms, and call signaling in memory, so they reset when the server restarts. It is a demo backend and does not provide persistent storage or user authentication. For push notifications, configure Firebase for the Android/iOS apps and give the Go API Firebase Application Default Credentials. See [PUSH_NOTIFICATIONS.md](PUSH_NOTIFICATIONS.md) for setup. Never put Firebase service-account credentials in the client app.
+The Go API stores servers, rooms, messages and push tokens in SQLite (`CHATTERBOX_DB`); call signaling stays in memory. It is a demo backend and does not provide persistent storage or user authentication. For push notifications, configure Firebase for the Android/iOS apps and give the Go API Firebase Application Default Credentials. See [PUSH_NOTIFICATIONS.md](PUSH_NOTIFICATIONS.md) for setup. Never put Firebase service-account credentials in the client app.
 
 ### Add chat servers and rooms
 
@@ -85,7 +85,7 @@ Edit [`server/config.json`](server/config.json) to add or rename servers and the
 { "id": "book-club", "name": "Book Club", "serverId": "hangout" }
 ```
 
-The API reads this file at startup from the repository root. To use another file, set `CHATTERBOX_SERVER_CONFIG` to its path. Restart or redeploy the API after editing the config. Room IDs also identify message history, so keep existing IDs if you want existing messages to stay associated with the same rooms.
+The API reads this file only when it creates a new database (`CHATTERBOX_DB`, default `chatterbox.db`); after that, servers and rooms live in the database. The API looks for the file relative to the repository root. To use another file, set `CHATTERBOX_SERVER_CONFIG` to its path. Restart or redeploy the API after editing the config. Room IDs also identify message history, so keep existing IDs if you want existing messages to stay associated with the same rooms.
 
 ### Deploy the Go API to Render
 
