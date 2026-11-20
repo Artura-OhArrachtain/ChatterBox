@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,22 +89,45 @@ type fakeMessageRepository struct {
 	nextID   int
 }
 
-func (f *fakeMessageRepository) List(_ context.Context, roomID string, limit int) ([]Message, error) {
-	result := make([]Message, 0)
+// List mirrors firestoreMessageRepository.List, treating insertion order as
+// createdAt order.
+func (f *fakeMessageRepository) List(_ context.Context, roomID string, page MessagePage) ([]Message, error) {
+	room := make([]Message, 0)
 	for _, message := range f.messages {
 		if message.RoomID == roomID {
-			result = append(result, message)
-			if len(result) == limit {
-				break
-			}
+			room = append(room, message)
 		}
 	}
-	return result, nil
+	index := func(id string) (int, error) {
+		for i, message := range room {
+			if message.ID == id {
+				return i, nil
+			}
+		}
+		return 0, ErrCursorNotFound
+	}
+	switch {
+	case page.After != "":
+		i, err := index(page.After)
+		if err != nil {
+			return nil, err
+		}
+		end := min(i+1+page.Limit, len(room))
+		return room[i+1 : end], nil
+	case page.Before != "":
+		i, err := index(page.Before)
+		if err != nil {
+			return nil, err
+		}
+		return room[max(0, i-page.Limit):i], nil
+	default:
+		return room[max(0, len(room)-page.Limit):], nil
+	}
 }
 
 func (f *fakeMessageRepository) Append(_ context.Context, message Message) (Message, error) {
 	f.nextID++
-	message.ID = "message-" + string(rune('0'+f.nextID))
+	message.ID = fmt.Sprintf("message-%d", f.nextID)
 	f.messages = append(f.messages, message)
 	return message, nil
 }
@@ -476,5 +500,61 @@ func TestCallSignalsRejectMalformedPeerRouting(t *testing.T) {
 		"/api/calls/signals?room=general&peer=bad%2Fpeer", "", "user-a", "a@example.com"))
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("malformed query peer status = %d, want 400", response.Code)
+	}
+}
+
+func TestMessagePagingParametersAndRoomScopedCursors(t *testing.T) {
+	messages := &fakeMessageRepository{}
+	for i := 1; i <= 7; i++ {
+		_, _ = messages.Append(context.Background(), Message{RoomID: "general", Content: fmt.Sprintf("m%d", i)})
+	}
+	_, _ = messages.Append(context.Background(), Message{RoomID: "other", Content: "elsewhere"}) // message-8
+	server := &chatServer{rooms: []Room{{ID: "general", Name: "general", ServerID: "hangout"}}, messages: messages}
+	get := func(query string) (int, []Message) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/api/messages?room=general"+query, nil)
+		request = request.WithContext(context.WithValue(request.Context(), identityContextKey{}, VerifiedToken{
+			UID: "user-a", Email: "a@example.com", EmailVerified: true,
+		}))
+		response := httptest.NewRecorder()
+		server.handleMessages(response, request)
+		var result []Message
+		if response.Code == http.StatusOK {
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return response.Code, result
+	}
+	contents := func(result []Message) string {
+		parts := make([]string, len(result))
+		for i, m := range result {
+			parts[i] = m.Content
+		}
+		return strings.Join(parts, ",")
+	}
+	for _, tc := range []struct {
+		query, want string
+		code        int
+	}{
+		{"", "m1,m2,m3,m4,m5,m6,m7", http.StatusOK},
+		{"&limit=3", "m5,m6,m7", http.StatusOK},
+		{"&limit=3&before=message-5", "m2,m3,m4", http.StatusOK},
+		{"&limit=3&before=message-2", "m1", http.StatusOK},
+		{"&limit=3&before=message-1", "", http.StatusOK},
+		{"&limit=3&after=message-5", "m6,m7", http.StatusOK},
+		{"&limit=1&after=message-2", "m3", http.StatusOK},
+		{"&after=message-7", "", http.StatusOK},
+		{"&before=message-8", "", http.StatusBadRequest}, // cursor from another room
+		{"&after=missing", "", http.StatusBadRequest},
+		{"&before=message-3&after=message-1", "", http.StatusBadRequest},
+		{"&limit=0", "", http.StatusBadRequest},
+		{"&limit=201", "", http.StatusBadRequest},
+		{"&limit=abc", "", http.StatusBadRequest},
+	} {
+		code, result := get(tc.query)
+		if code != tc.code || contents(result) != tc.want {
+			t.Errorf("query %q: got %d %q, want %d %q", tc.query, code, contents(result), tc.code, tc.want)
+		}
 	}
 }

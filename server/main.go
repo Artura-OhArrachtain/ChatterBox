@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -613,11 +616,20 @@ func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		page, err := parseMessagePage(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if s.messages == nil {
 			writeJSON(w, http.StatusOK, []Message{})
 			return
 		}
-		result, err := s.messages.List(r.Context(), roomID, 200)
+		result, err := s.messages.List(r.Context(), roomID, page)
+		if errors.Is(err, ErrCursorNotFound) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if err != nil {
 			http.Error(w, "could not load messages", http.StatusInternalServerError)
 			return
@@ -680,6 +692,33 @@ func (s *chatServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	go s.notifyOtherDevices(msg)
 	writeJSON(w, http.StatusCreated, msg)
+}
+
+const (
+	// Requests without a limit keep the previous behaviour (newest 200).
+	defaultMessagePageSize = 200
+	maxMessagePageSize     = 200
+)
+
+// parseMessagePage reads the optional before, after and limit query parameters
+// of GET /api/messages.
+func parseMessagePage(q url.Values) (MessagePage, error) {
+	page := MessagePage{
+		Before: strings.TrimSpace(q.Get("before")),
+		After:  strings.TrimSpace(q.Get("after")),
+		Limit:  defaultMessagePageSize,
+	}
+	if page.Before != "" && page.After != "" {
+		return page, errors.New("use either before or after, not both")
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > maxMessagePageSize {
+			return page, fmt.Errorf("limit must be between 1 and %d", maxMessagePageSize)
+		}
+		page.Limit = n
+	}
+	return page, nil
 }
 
 func cors(next http.Handler) http.Handler {

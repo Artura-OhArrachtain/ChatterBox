@@ -210,6 +210,10 @@ class _ChatHomeState extends State<ChatHome> {
     ChatRoom('random', 'random')
   ];
   List<ChatMessage> _messages = const [];
+  String _loadedConversationId = '';
+  bool _hasOlderMessages = false;
+  bool _loadingOlderMessages = false;
+  final _messageScroll = ScrollController();
   String _apiBase = apiBase;
   String _roomId = 'general';
   String _serverId = 'hangout';
@@ -262,6 +266,7 @@ class _ChatHomeState extends State<ChatHome> {
   void initState() {
     super.initState();
     _loadColorSettings();
+    _messageScroll.addListener(_onMessageScroll);
     _initializePushNotifications();
     _poller = Timer.periodic(const Duration(seconds: 3), (_) => _refresh());
   }
@@ -269,6 +274,7 @@ class _ChatHomeState extends State<ChatHome> {
   @override
   void dispose() {
     _poller?.cancel();
+    _messageScroll.dispose();
     _pushSubscription?.cancel();
     _pushTokenSubscription?.cancel();
     unawaited(_speech.stop());
@@ -517,25 +523,16 @@ class _ChatHomeState extends State<ChatHome> {
       }
       final conversationId =
           _showDirectMessages ? activeDM?.conversationId : selected;
-      var messages = <ChatMessage>[];
+      // After the first page of a conversation, ask only for newer messages.
+      final catchingUp = conversationId != null &&
+          conversationId == _loadedConversationId &&
+          _messages.isNotEmpty;
+      var page = <ChatMessage>[];
       if (conversationId != null) {
-        final messageResponse = await http
-            .get(
-                Uri.parse('$_apiBase/api/messages')
-                    .replace(queryParameters: {'room': conversationId}),
-                headers: headers)
-            .timeout(const Duration(seconds: 3));
-        if (messageResponse.statusCode == 401) {
-          await FirebaseAuth.instance.signOut();
-          return;
-        }
-        if (messageResponse.statusCode != 200) {
-          throw Exception(
-              'Could not load messages (${messageResponse.statusCode})');
-        }
-        messages = (jsonDecode(messageResponse.body) as List)
-            .map((item) => ChatMessage.fromJson(item as Map<String, dynamic>))
-            .toList();
+        final fetched = await _fetchMessages(conversationId, headers,
+            after: catchingUp ? _messages.last.id : null);
+        if (fetched == null) return; // signed out
+        page = fetched;
       }
       if (mounted) {
         setState(() {
@@ -545,9 +542,23 @@ class _ChatHomeState extends State<ChatHome> {
           _roomId = selected;
           _contacts = contacts;
           _activeDM = activeDM;
-          _messages = messages;
+          if (conversationId == null) {
+            _resetMessages();
+          } else if (catchingUp) {
+            final known = _messages.map((m) => m.id).toSet();
+            final fresh = page.where((m) => !known.contains(m.id));
+            if (fresh.isNotEmpty) _messages = [..._messages, ...fresh];
+          } else {
+            _messages = page;
+            _hasOlderMessages = page.length >= _messagePageSize;
+            _loadedConversationId = conversationId;
+          }
           _online = true;
         });
+        // A newly opened conversation starts at its newest message.
+        if (!catchingUp && _messageScroll.hasClients) {
+          _messageScroll.jumpTo(0);
+        }
       }
       if (roomWasRestored) unawaited(_saveLastChat());
     } catch (error) {
@@ -590,6 +601,80 @@ class _ChatHomeState extends State<ChatHome> {
     }
   }
 
+  static const _messagePageSize = 50;
+
+  /// Fetches one page of messages, oldest first. With [after], returns
+  /// messages newer than that message; with [before], the page just older
+  /// than it; otherwise the newest page. Returns null if the session expired
+  /// (the user is signed out).
+  Future<List<ChatMessage>?> _fetchMessages(
+      String conversationId, Map<String, String> headers,
+      {String? before, String? after}) async {
+    final uri = Uri.parse('$_apiBase/api/messages').replace(queryParameters: {
+      'room': conversationId,
+      'limit': '$_messagePageSize',
+      if (before != null) 'before': before,
+      if (after != null) 'after': after,
+    });
+    final response = await http
+        .get(uri, headers: headers)
+        .timeout(const Duration(seconds: 5));
+    if (response.statusCode == 401) {
+      await FirebaseAuth.instance.signOut();
+      return null;
+    }
+    if (response.statusCode != 200) {
+      throw Exception('Could not load messages (${response.statusCode})');
+    }
+    return (jsonDecode(response.body) as List)
+        .map((item) => ChatMessage.fromJson(item as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<void> _loadOlderMessages() async {
+    if (_loadingOlderMessages || !_hasOlderMessages || _messages.isEmpty) {
+      return;
+    }
+    final conversationId = _loadedConversationId;
+    setState(() => _loadingOlderMessages = true);
+    try {
+      final older = await _fetchMessages(conversationId, await apiAuthHeaders(),
+          before: _messages.first.id);
+      if (older == null ||
+          !mounted ||
+          conversationId != _loadedConversationId) {
+        return;
+      }
+      setState(() {
+        final known = _messages.map((m) => m.id).toSet();
+        _messages = [
+          ...older.where((m) => !known.contains(m.id)),
+          ..._messages
+        ];
+        _hasOlderMessages = older.length >= _messagePageSize;
+      });
+    } catch (error) {
+      debugPrint('Loading older messages failed: $error');
+      if (mounted) _snack('Couldn’t load older messages.');
+    } finally {
+      if (mounted) setState(() => _loadingOlderMessages = false);
+    }
+  }
+
+  void _onMessageScroll() {
+    final position = _messageScroll.position;
+    // The list is reversed, so maxScrollExtent is the top (oldest messages).
+    if (position.pixels >= position.maxScrollExtent - 400) {
+      _loadOlderMessages();
+    }
+  }
+
+  void _resetMessages() {
+    _messages = const [];
+    _loadedConversationId = '';
+    _hasOlderMessages = false;
+  }
+
   void _selectServer(ChatServer server) {
     if (_serverId == server.id) {
       if (_showDirectMessages) {
@@ -606,7 +691,7 @@ class _ChatHomeState extends State<ChatHome> {
       _roomId = '';
       _activeDM = null;
       _showDirectMessages = false;
-      _messages = const [];
+      _resetMessages();
     });
     unawaited(_saveLastChat());
     if (MediaQuery.sizeOf(context).width < 720) {
@@ -649,7 +734,7 @@ class _ChatHomeState extends State<ChatHome> {
         _activeDM = conversation;
         _savedDirectMessageId = conversation.id;
         _showDirectMessages = true;
-        _messages = const [];
+        _resetMessages();
       });
       await _saveLastChat();
       if (!mounted) return;
@@ -2068,15 +2153,23 @@ class _ChatHomeState extends State<ChatHome> {
         Expanded(
             child: _messages.isEmpty
                 ? _emptyChat()
+                // Reversed so the list starts at the newest message and
+                // stays anchored to the bottom as messages arrive.
                 : ListView(
+                    controller: _messageScroll,
+                    reverse: true,
                     padding: EdgeInsets.fromLTRB(
                         phone ? 14 : 22, 20, phone ? 14 : 22, 20),
                     children: [
+                      if (_hasOlderMessages)
+                        _olderMessagesRow()
+                      else ...[
                         SizedBox(height: phone ? 34 : 100),
                         _welcomeHeader(),
                         const SizedBox(height: 22),
-                        ..._messages.map(_messageTile)
-                      ])),
+                      ],
+                      ..._messages.map(_messageTile)
+                    ].reversed.toList())),
         Padding(
             padding: EdgeInsets.fromLTRB(phone ? 10 : 20, 8, phone ? 10 : 20,
                 MediaQuery.paddingOf(context).bottom + 10),
@@ -2132,6 +2225,19 @@ class _ChatHomeState extends State<ChatHome> {
                       icon: Icon(Icons.send_rounded, color: accent))
                 ]))),
       ]);
+
+  Widget _olderMessagesRow() => Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Center(
+          child: _loadingOlderMessages
+              ? const SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2))
+              : TextButton.icon(
+                  onPressed: _loadOlderMessages,
+                  icon: const Icon(Icons.history, size: 18),
+                  label: const Text('Load older messages'))));
 
   Widget _chatHeader({required bool phone}) {
     if (phone) {

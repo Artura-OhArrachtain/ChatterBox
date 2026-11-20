@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"time"
 
@@ -47,8 +48,25 @@ type DMRepository interface {
 	IsParticipant(ctx context.Context, conversationID, uid string) (bool, error)
 }
 
+// MessagePage selects a page of a room's messages. Results are always oldest
+// first.
+//
+//   - After set: up to Limit messages newer than that message (catching up).
+//   - Before set: up to Limit messages just older than that message
+//     (scrolling back through history).
+//   - Neither: the newest Limit messages.
+//
+// Before and After are message IDs and must belong to the same room.
+type MessagePage struct {
+	Before, After string
+	Limit         int
+}
+
+// ErrCursorNotFound means a Before/After message ID does not exist in the room.
+var ErrCursorNotFound = errors.New("cursor message not found in this room")
+
 type MessageRepository interface {
-	List(ctx context.Context, roomID string, limit int) ([]Message, error)
+	List(ctx context.Context, roomID string, page MessagePage) ([]Message, error)
 	Append(ctx context.Context, message Message) (Message, error)
 }
 
@@ -223,18 +241,33 @@ func conversationFromSnapshot(doc *firestore.DocumentSnapshot) Conversation {
 	return Conversation{ID: doc.Ref.ID, ParticipantIDs: ids, CreatedAt: createdAt}
 }
 
-func (r *firestoreMessageRepository) List(ctx context.Context, roomID string, limit int) ([]Message, error) {
-	if limit < 1 {
-		limit = 1
+func (r *firestoreMessageRepository) List(ctx context.Context, roomID string, page MessagePage) ([]Message, error) {
+	if page.Limit < 1 {
+		page.Limit = 1
 	}
-	if limit > 500 {
-		limit = 500
+	if page.Limit > 500 {
+		page.Limit = 500
 	}
-	iter := r.client.Collection("messages").
-		Where("roomId", "==", roomID).
-		OrderBy("createdAt", firestore.Desc).
-		Limit(limit).
-		Documents(ctx)
+	query := r.client.Collection("messages").Where("roomId", "==", roomID)
+	newestFirst := true
+	switch {
+	case page.After != "":
+		cursor, err := r.cursor(ctx, roomID, page.After)
+		if err != nil {
+			return nil, err
+		}
+		query = query.OrderBy("createdAt", firestore.Asc).StartAfter(cursor)
+		newestFirst = false
+	case page.Before != "":
+		cursor, err := r.cursor(ctx, roomID, page.Before)
+		if err != nil {
+			return nil, err
+		}
+		query = query.OrderBy("createdAt", firestore.Desc).StartAfter(cursor)
+	default:
+		query = query.OrderBy("createdAt", firestore.Desc)
+	}
+	iter := query.Limit(page.Limit).Documents(ctx)
 	defer iter.Stop()
 	result := make([]Message, 0)
 	for {
@@ -247,10 +280,32 @@ func (r *firestoreMessageRepository) List(ctx context.Context, roomID string, li
 		}
 		result = append(result, messageFromSnapshot(doc))
 	}
-	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
-		result[left], result[right] = result[right], result[left]
+	if newestFirst {
+		for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
+			result[left], result[right] = result[right], result[left]
+		}
 	}
 	return result, nil
+}
+
+// cursor loads the message used as a paging cursor. Paging from a document
+// snapshot makes Firestore order ties on createdAt by document ID, so no
+// message is skipped or repeated across pages.
+func (r *firestoreMessageRepository) cursor(ctx context.Context, roomID, messageID string) (*firestore.DocumentSnapshot, error) {
+	if strings.Contains(messageID, "/") {
+		return nil, ErrCursorNotFound
+	}
+	doc, err := r.client.Collection("messages").Doc(messageID).Get(ctx)
+	if status.Code(err) == codes.NotFound {
+		return nil, ErrCursorNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if stringValue(doc.Data()["roomId"]) != roomID {
+		return nil, ErrCursorNotFound
+	}
+	return doc, nil
 }
 
 func (r *firestoreMessageRepository) Append(ctx context.Context, message Message) (Message, error) {
