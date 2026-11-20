@@ -46,6 +46,7 @@ type CallSignal struct {
 	RoomID    string    `json:"roomId"`
 	From      string    `json:"from"`
 	To        string    `json:"to,omitempty"`
+	OwnerUID  string    `json:"-"`
 	Type      string    `json:"type"`
 	SDP       string    `json:"sdp,omitempty"`
 	Candidate string    `json:"candidate,omitempty"`
@@ -179,46 +180,69 @@ func loadServerConfig() (serverConfig, error) {
 	return config, nil
 }
 
+const maxPushTokenBytes = 4096
+
 func (s *chatServer) handlePushRegistration(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
 		methodNotAllowed(w)
+		return
+	}
+	identity, ok := UserIdentityFromContext(r.Context())
+	if !ok || strings.TrimSpace(identity.UID) == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	var input struct {
 		Token string `json:"token"`
-		User  string `json:"user"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&input); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	input.Token, input.User = strings.TrimSpace(input.Token), strings.TrimSpace(input.User)
-	if input.Token == "" || input.User == "" {
-		http.Error(w, "token and user are required", http.StatusBadRequest)
+	input.Token = strings.TrimSpace(input.Token)
+	if input.Token == "" || len(input.Token) > maxPushTokenBytes {
+		http.Error(w, "token must be 1 to 4096 bytes", http.StatusBadRequest)
 		return
 	}
 	s.mu.Lock()
-	s.pushTokens[input.Token] = input.User
+	if r.Method == http.MethodPost {
+		if s.pushTokens == nil {
+			s.pushTokens = make(map[string]string)
+		}
+		if owner, exists := s.pushTokens[input.Token]; exists && owner != identity.UID {
+			s.mu.Unlock()
+			http.Error(w, "push token is already registered", http.StatusConflict)
+			return
+		}
+		s.pushTokens[input.Token] = identity.UID
+	} else if s.pushTokens[input.Token] == identity.UID {
+		delete(s.pushTokens, input.Token)
+	}
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *chatServer) pushTokensForOtherUsers(authorUID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tokens := make([]string, 0, len(s.pushTokens))
+	for token, uid := range s.pushTokens {
+		if uid != authorUID {
+			tokens = append(tokens, token)
+		}
+	}
+	return tokens
 }
 
 func (s *chatServer) notifyOtherDevices(msg Message) {
 	if s.fcm == nil {
 		return
 	}
-	s.mu.RLock()
-	tokens := make([]string, 0, len(s.pushTokens))
-	for token, user := range s.pushTokens {
-		if user != msg.Author {
-			tokens = append(tokens, token)
-		}
-	}
-	s.mu.RUnlock()
+	tokens := s.pushTokensForOtherUsers(msg.AuthorID)
 	if len(tokens) == 0 {
 		return
 	}
@@ -242,11 +266,16 @@ func (s *chatServer) handleCallSignals(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	identity, _ := UserIdentityFromContext(r.Context())
+	identity, ok := UserIdentityFromContext(r.Context())
+	if !ok || strings.TrimSpace(identity.UID) == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	if r.Method == http.MethodGet {
 		roomID := r.URL.Query().Get("room")
-		if roomID == "" {
-			http.Error(w, "room is required", http.StatusBadRequest)
+		peerID := r.URL.Query().Get("peer")
+		if roomID == "" || !validCallPeerID(peerID) {
+			http.Error(w, "room and valid peer are required", http.StatusBadRequest)
 			return
 		}
 		allowed, err := s.roomAllowed(r.Context(), roomID, identity.UID)
@@ -259,14 +288,17 @@ func (s *chatServer) handleCallSignals(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var after int64
-		if _, err := fmt.Sscan(r.URL.Query().Get("after"), &after); err != nil {
-			after = 0
+		if rawAfter := r.URL.Query().Get("after"); rawAfter != "" {
+			if _, err := fmt.Sscan(rawAfter, &after); err != nil || after < 0 {
+				http.Error(w, "invalid after cursor", http.StatusBadRequest)
+				return
+			}
 		}
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 		result := make([]CallSignal, 0)
 		for _, signal := range s.signals {
-			if signal.ID > after && signal.RoomID == roomID && signal.From != identity.UID && (signal.To == "" || signal.To == identity.UID) {
+			if signal.ID > after && signal.RoomID == roomID && signal.OwnerUID != identity.UID && (signal.To == "" || signal.To == peerID) {
 				result = append(result, signal)
 			}
 		}
@@ -283,11 +315,11 @@ func (s *chatServer) handleCallSignals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	signal.RoomID, signal.To, signal.Type = strings.TrimSpace(signal.RoomID), strings.TrimSpace(signal.To), strings.TrimSpace(signal.Type)
-	signal.From = identity.UID
-	if signal.RoomID == "" || signal.From == "" || signal.Type == "" {
-		http.Error(w, "roomId and type are required", http.StatusBadRequest)
+	if signal.RoomID == "" || !validCallPeerID(signal.From) || signal.Type == "" || (signal.To != "" && !validCallPeerID(signal.To)) {
+		http.Error(w, "roomId, valid from peer, and type are required; to must be a valid peer when set", http.StatusBadRequest)
 		return
 	}
+	signal.OwnerUID = identity.UID
 	allowed, err := s.roomAllowed(r.Context(), signal.RoomID, identity.UID)
 	if err != nil {
 		http.Error(w, "could not verify conversation membership", http.StatusInternalServerError)
@@ -312,6 +344,21 @@ func (s *chatServer) handleCallSignals(w http.ResponseWriter, r *http.Request) {
 		s.signals = append([]CallSignal(nil), s.signals[len(s.signals)-1000:]...)
 	}
 	writeJSON(w, http.StatusCreated, signal)
+}
+
+func validCallPeerID(peerID string) bool {
+	if len(peerID) == 0 || len(peerID) > 128 {
+		return false
+	}
+	for _, char := range peerID {
+		if (char < 'a' || char > 'z') &&
+			(char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') &&
+			char != '-' && char != '_' && char != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *chatServer) handleRooms(w http.ResponseWriter, r *http.Request) {
@@ -639,7 +686,7 @@ func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -651,6 +698,6 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func methodNotAllowed(w http.ResponseWriter) {
-	w.Header().Set("Allow", strings.Join([]string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodOptions}, ", "))
+	w.Header().Set("Allow", strings.Join([]string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions}, ", "))
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }

@@ -22,8 +22,7 @@ class _CallScreenState extends State<CallScreen> {
   void initState() {
     super.initState();
     widget.session.start().catchError((Object error) {
-      widget.session.status = 'Could not start call: $error';
-      widget.session.notifyListeners();
+      widget.session.reportStartupError(error);
     });
   }
 

@@ -2,9 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
+
+import 'auth_gate.dart';
 
 class CallSession extends ChangeNotifier {
   CallSession(
@@ -50,6 +53,11 @@ class CallSession extends ChangeNotifier {
 
   bool get muted => _muted;
   bool get cameraOff => _cameraOff;
+
+  void reportStartupError(Object error) {
+    status = 'Could not start call: $error';
+    notifyListeners();
+  }
 
   Future<void> start() async {
     await localRenderer.initialize();
@@ -127,11 +135,18 @@ class CallSession extends ChangeNotifier {
       body['sdpMid'] = candidate.sdpMid;
       body['sdpMLineIndex'] = candidate.sdpMLineIndex;
     }
-    await http
+    final response = await http
         .post(Uri.parse('$apiBase/api/calls/signals'),
-            headers: {'Content-Type': 'application/json'},
+            headers: await apiAuthHeaders(jsonBody: true),
             body: jsonEncode(body))
         .timeout(const Duration(seconds: 5));
+    if (response.statusCode == 401) {
+      await FirebaseAuth.instance.signOut();
+      throw StateError('Sign-in expired during the call.');
+    }
+    if (response.statusCode != 201) {
+      throw Exception('Call signaling failed (${response.statusCode}).');
+    }
   }
 
   Future<void> _poll() async {
@@ -144,8 +159,25 @@ class CallSession extends ChangeNotifier {
             'peer': peerId,
             'after': '$_cursor'
           });
-      final response = await http.get(uri).timeout(const Duration(seconds: 4));
-      if (response.statusCode != 200) return;
+      final response = await http
+          .get(uri, headers: await apiAuthHeaders())
+          .timeout(const Duration(seconds: 4));
+      if (response.statusCode == 401) {
+        await FirebaseAuth.instance.signOut();
+        status = 'Sign-in expired';
+        notifyListeners();
+        await end();
+        return;
+      }
+      if (response.statusCode == 403) {
+        status = 'You no longer have access to this conversation';
+        notifyListeners();
+        await end();
+        return;
+      }
+      if (response.statusCode != 200) {
+        throw Exception('Call polling failed (${response.statusCode}).');
+      }
       final events = jsonDecode(response.body) as List<dynamic>;
       for (final raw in events) {
         final event = raw as Map<String, dynamic>;

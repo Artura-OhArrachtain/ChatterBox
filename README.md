@@ -22,30 +22,50 @@ Open the [ChatterBox web app](https://artura-oharrachtain.github.io/ChatterBox/)
 
 ### Publish the first Android download
 
-Complete these one-time steps as a repository maintainer:
+This beta uses Firebase Authentication and Firestore. Complete the Firebase and API setup before publishing a web or Android build.
 
-1. Deploy the Go API to Render using [`render.yaml`](render.yaml). Copy the API’s public HTTPS URL.
-2. In the GitHub repository, open **Settings → Secrets and variables → Actions**. Add repository variable `CHATTERBOX_API_URL` with the API URL.
-3. Create an Android signing key and store a secure backup of `chatterbox-release.jks`:
+1. Create a Firebase project. Enable **Authentication → Sign-in method → Email/Password**, create a Firestore database, and register a Web app and an Android app with application ID `app.chatterbox.mobile`. Enable email verification in the Firebase Authentication email templates. Add `artura-oharrachtain.github.io` to **Authentication → Settings → Authorized domains**.
+2. Deploy the Firestore security rules and required query indexes from this repository. Install the [Firebase CLI](https://firebase.google.com/docs/cli), then run from the repository root:
+
+   ```sh
+   firebase deploy --only firestore --project YOUR_FIREBASE_PROJECT_ID
+   ```
+
+   The deployed rules deny direct client access; the authenticated Go API uses the Firebase Admin SDK.
+3. In the Firebase project settings, copy the Web API key, project ID, messaging sender ID, Web app ID, and Android app ID. In GitHub, open **Settings → Secrets and variables → Actions → Variables** and add:
+
+   - `FIREBASE_API_KEY`
+   - `FIREBASE_PROJECT_ID`
+   - `FIREBASE_MESSAGING_SENDER_ID`
+   - `FIREBASE_WEB_APP_ID`
+   - `FIREBASE_ANDROID_APP_ID`
+   - `FIREBASE_AUTH_DOMAIN` (optional; defaults to `YOUR_FIREBASE_PROJECT_ID.firebaseapp.com`)
+
+   These client settings are compiled into the app and are not service-account credentials. Do not put an Admin SDK key in GitHub variables or in the client.
+4. Create a Firebase service account with access to Firestore and Firebase Cloud Messaging. Deploy the Go API to Render using [`render.yaml`](render.yaml); set `FIREBASE_PROJECT_ID` and upload the service-account JSON as a Render secret file. Set `GOOGLE_APPLICATION_CREDENTIALS` to its mounted path, for example `/etc/secrets/firebase-admin.json`. Copy the deployed API’s public HTTPS URL.
+5. Add GitHub Actions repository variable `CHATTERBOX_API_URL` with the API URL. The Pages and Android workflows now stop with an explicit error if the required API or Firebase client settings are missing.
+6. Create an Android signing key and store a secure backup of `chatterbox-release.jks`:
 
 ```sh
 keytool -genkeypair -v -keystore chatterbox-release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias chatterbox
 base64 < chatterbox-release.jks | tr -d '\n'
 ```
 
-4. Add the base64 output as secret `ANDROID_KEYSTORE_BASE64`. Add the alias as `ANDROID_KEY_ALIAS`, and the key/store passwords as `ANDROID_KEY_PASSWORD` and `ANDROID_KEYSTORE_PASSWORD`.
-5. Push a new version tag from the repository root. The tag version should match the app version in `client/pubspec.yaml` (without the leading `v`):
+7. Add the base64 output as GitHub Actions secret `ANDROID_KEYSTORE_BASE64`. Add the alias as `ANDROID_KEY_ALIAS`, and the key/store passwords as `ANDROID_KEY_PASSWORD` and `ANDROID_KEYSTORE_PASSWORD`.
+8. Push a new version tag from the repository root. The tag version should match the app version in `client/pubspec.yaml` (without the leading `v`):
 
 ```sh
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-6. Wait for the **Package Android app** workflow to finish. It creates a GitHub Release containing **ChatterBox-Android.apk** for direct installation and **ChatterBox-Android.aab** for Google Play. Future updates must be signed with the same keystore.
+9. Wait for the **Package Android app** workflow to finish. It creates a GitHub Release containing **ChatterBox-Android.apk** for direct installation and **ChatterBox-Android.aab** for Google Play. Future updates must be signed with the same keystore.
 
 To attach an APK to a release without using git commands, open **Actions → Package Android app → Run workflow**, enter the existing release tag (for example, `v1.0.0`), and run it. The workflow builds the APK and App Bundle and attaches both to that release. Leave the tag field empty to build an APK artifact only.
 
 To publish the web install page, enable **Settings → Pages → Build and deployment → GitHub Actions**. The Pages workflow deploys the site after pushes to `main`; first publication may take a few minutes.
+
+Before sharing the beta, test with two verified accounts: create accounts, verify the email links, search for one another, exchange DM messages, sign out, and sign back in. Calls use WebRTC/STUN and may require a TURN service on restrictive networks. The API currently keeps call signaling and push-token registrations in memory; they are lost when it restarts. Open registration has no rate limiting or moderation tooling yet, so treat this as a small beta, not a production-scale launch.
 
 ## Run locally
 
@@ -61,37 +81,34 @@ export GIT_CONFIG_KEY_0=safe.directory
 export GIT_CONFIG_VALUE_0="$PWD/.deps/flutter"
 ```
 
-Start the Go API in one terminal:
+The Go API requires Firebase Admin credentials and a project configured for Authentication and Firestore. Keep the service-account JSON outside the repository. Start the API in one terminal:
 
 ```sh
+export FIREBASE_PROJECT_ID=your-firebase-project-id
+export GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/firebase-admin.json
 go run ./server
 ```
 
-It listens on `http://localhost:8080`. In another terminal, run the Flutter client:
+It listens on `http://localhost:8080`. In another terminal, run the Flutter client with the client app settings from Firebase project settings:
 
 ```sh
 cd client
 flutter pub get
-flutter run
+flutter run -d web-server --web-port=8081 \
+  --dart-define=CHATTERBOX_API=http://localhost:8080 \
+  --dart-define=FIREBASE_API_KEY=your-web-api-key \
+  --dart-define=FIREBASE_PROJECT_ID=your-firebase-project-id \
+  --dart-define=FIREBASE_MESSAGING_SENDER_ID=your-sender-id \
+  --dart-define=FIREBASE_WEB_APP_ID=your-web-app-id
 ```
 
-To run the web client with the local API, use:
-
-```sh
-flutter run -d chrome --dart-define=CHATTERBOX_API=http://localhost:8080
-```
-
-If Chrome is not installed, run the web-server device instead and open the printed URL in a browser:
-
-```sh
-flutter run -d web-server --web-port=8081 --dart-define=CHATTERBOX_API=http://localhost:8080
-```
+Open the printed URL in a browser. Use `flutter run -d chrome` instead if Chrome is installed. For Android, use the same common Firebase defines, replace `FIREBASE_WEB_APP_ID` with `FIREBASE_ANDROID_APP_ID`, and run `flutter run -d <device>`.
 
 For a production web or mobile build, set `CHATTERBOX_API_URL` as a GitHub Actions repository variable. The workflows pass it to Flutter as `CHATTERBOX_API`. The API must be reachable by the device/browser; on a physical phone, `localhost` means the phone itself, so use the development computer’s network address or a deployed API URL.
 
 ## Backend and notifications
 
-The Go API currently keeps chat messages, rooms, and call signaling in memory, so they reset when the server restarts. It is a demo backend and does not provide persistent storage or user authentication. For push notifications, configure Firebase for the Android/iOS apps and give the Go API Firebase Application Default Credentials. See [PUSH_NOTIFICATIONS.md](PUSH_NOTIFICATIONS.md) for setup. Never put Firebase service-account credentials in the client app.
+Firebase Authentication requires a verified email before the API accepts requests. User profiles, DMs, and messages are stored in Firestore; deploy [firestore.rules](firestore.rules), [firestore.indexes.json](firestore.indexes.json), and [firebase.json](firebase.json) before starting the beta. The API uses Firebase Admin Application Default Credentials from `GOOGLE_APPLICATION_CREDENTIALS` locally and on Render. Push delivery requires those credentials to have Firebase Cloud Messaging access. See [PUSH_NOTIFICATIONS.md](PUSH_NOTIFICATIONS.md) for platform details. Never put Firebase service-account credentials in the client app.
 
 ### Add chat servers and rooms
 
@@ -105,9 +122,9 @@ The API reads this file at startup from the repository root. To use another file
 
 ### Deploy the Go API to Render
 
-The root [`render.yaml`](render.yaml) defines a Render web service for the Go API. In Render, create a **Blueprint** from this GitHub repository and deploy the `chatterbox-api` service. Render builds the Go server, starts it on Render’s assigned `PORT`, and checks `/health`. After deployment, set the GitHub Actions repository variable `CHATTERBOX_API_URL` to the service’s HTTPS URL so the web and mobile release workflows point clients to that API.
+The root [`render.yaml`](render.yaml) defines a Render web service for the Go API and prompts for `FIREBASE_PROJECT_ID` and `GOOGLE_APPLICATION_CREDENTIALS`. In Render, create a **Blueprint** from this GitHub repository and deploy the `chatterbox-api` service. Add the service-account JSON as a secret file, set `GOOGLE_APPLICATION_CREDENTIALS` to its mounted path, and ensure the service account can access Firestore and Firebase Cloud Messaging. Render starts the Go server on its assigned `PORT` and checks `/health`. Set GitHub Actions variable `CHATTERBOX_API_URL` to the service’s HTTPS URL.
 
-The free service can sleep when idle, and this demo stores messages and call signaling in memory. A restart or redeploy clears that state; use persistent storage before relying on it for real conversations.
+The free service can sleep when idle. Firestore-backed profiles and messages persist across restarts, but call signaling and push-token registrations currently do not; calls may be interrupted and users may need to reopen the app to register push tokens after an API restart.
 
 ## Build commands
 

@@ -31,7 +31,7 @@ FirebaseOptions? firebaseOptionsForCurrentPlatform() {
   switch (defaultTargetPlatform) {
     case TargetPlatform.android:
       if (_androidAppId.isEmpty) return null;
-      return FirebaseOptions(
+      return const FirebaseOptions(
         apiKey: _apiKey,
         appId: _androidAppId,
         messagingSenderId: _messagingSenderId,
@@ -39,7 +39,7 @@ FirebaseOptions? firebaseOptionsForCurrentPlatform() {
       );
     case TargetPlatform.iOS:
       if (_iosAppId.isEmpty || _iosBundleId.isEmpty) return null;
-      return FirebaseOptions(
+      return const FirebaseOptions(
         apiKey: _apiKey,
         appId: _iosAppId,
         messagingSenderId: _messagingSenderId,

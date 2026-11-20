@@ -85,11 +85,32 @@ class ChatServer {
 }
 
 class ChatContact {
-  const ChatContact(this.id, this.name, this.status, this.color);
+  const ChatContact({
+    required this.id,
+    required this.name,
+    required this.conversationId,
+    this.status = 'Direct message',
+    this.color = accent,
+  });
+
   final String id;
   final String name;
   final String status;
   final Color color;
+  final String? conversationId;
+
+  factory ChatContact.fromProfile(Map<String, dynamic> json) => ChatContact(
+        id: json['uid'] as String,
+        name: json['displayName'] as String,
+        conversationId: null,
+      );
+
+  factory ChatContact.fromConversation(Map<String, dynamic> json) =>
+      ChatContact(
+        id: json['otherUserId'] as String,
+        name: json['otherDisplayName'] as String,
+        conversationId: json['id'] as String,
+      );
 }
 
 class GifLibraryItem {
@@ -103,15 +124,18 @@ class ChatMessage {
   const ChatMessage(
       {required this.id,
       required this.author,
+      required this.authorId,
       required this.content,
       required this.createdAt});
-  final int id;
+  final String id;
   final String author;
+  final String authorId;
   final String content;
   final DateTime createdAt;
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
-        id: json['id'] as int,
+        id: json['id'] as String,
         author: json['author'] as String,
+        authorId: json['authorId'] as String,
         content: json['content'] as String,
         createdAt: DateTime.parse(json['createdAt'] as String),
       );
@@ -159,12 +183,7 @@ class _ChatHomeState extends State<ChatHome> {
     ChatServer('hangout', 'The Hangout'),
     ChatServer('test', 'Test Server')
   ];
-  static const _contacts = <ChatContact>[
-    ChatContact(
-        'maya', 'Maya Chen', 'Building something cool', Color(0xFFB478D3)),
-    ChatContact('leo', 'Leo Park', 'Listening to music', Color(0xFF55B99A)),
-    ChatContact('sam', 'Sam Rivera', 'Away', Color(0xFFE49A5A)),
-  ];
+  List<ChatContact> _contacts = [];
   static const _gifLibrary = <GifLibraryItem>[
     GifLibraryItem('Excited', 'Reactions',
         'https://media.giphy.com/media/5GoVLqeAOo6PK/giphy.gif'),
@@ -195,7 +214,11 @@ class _ChatHomeState extends State<ChatHome> {
   String _roomId = 'general';
   String _serverId = 'hangout';
   ChatContact? _activeDM;
+  String? _savedDirectMessageId;
   bool _showDirectMessages = false;
+  bool _profileLoaded = false;
+  bool _refreshing = false;
+  DateTime? _lastDirectMessageFetch;
   Set<String> _favoriteContactIds = <String>{};
   bool _online = false;
   bool _sending = false;
@@ -217,7 +240,7 @@ class _ChatHomeState extends State<ChatHome> {
   String _profileName = 'You';
   String _profileStatus = 'Online';
   int _profileColorValue = 0xFFB478D3;
-  int? _speakingMessageId;
+  String? _speakingMessageId;
   String _speechPrefix = '';
   Timer? _poller;
   ChatRoom get _room => _rooms.firstWhere((room) => room.id == _roomId,
@@ -225,8 +248,7 @@ class _ChatHomeState extends State<ChatHome> {
   ChatServer get _server =>
       _servers.firstWhere((server) => server.id == _serverId,
           orElse: () => _servers.first);
-  String get _conversationId =>
-      _activeDM == null ? _roomId : 'dm-${_activeDM!.id}';
+  String get _conversationId => _activeDM?.conversationId ?? _roomId;
   Color get _profileColor => Color(_profileColorValue);
   String get _profileInitials {
     final parts = _profileName.trim().split(RegExp(r'\s+'));
@@ -270,32 +292,64 @@ class _ChatHomeState extends State<ChatHome> {
         final body = message.notification?.body ?? '';
         if (mounted) _snack(body.isEmpty ? title : '$title: $body');
       });
-      _pushTokenSubscription = messaging.onTokenRefresh
-          .listen((token) => unawaited(_registerPushToken(token)));
+      _pushTokenSubscription =
+          messaging.onTokenRefresh.listen(_registerPushTokenInBackground);
       final token = await _getPushToken(messaging);
-      if (token != null) unawaited(_registerPushToken(token));
+      if (token != null) await _registerPushToken(token);
     } catch (error) {
       debugPrint('Push notifications are not configured: $error');
     }
   }
 
   Future<void> _registerPushToken(String token) async {
-    try {
-      await http.post(Uri.parse('$_apiBase/api/push/register'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'token': token, 'user': _profileName}));
-    } catch (_) {
-      // Registration is retried when Firebase rotates the token.
+    final response = await http
+        .post(Uri.parse('$_apiBase/api/push/register'),
+            headers: await apiAuthHeaders(jsonBody: true),
+            body: jsonEncode({'token': token}))
+        .timeout(const Duration(seconds: 5));
+    if (response.statusCode == 401) {
+      await FirebaseAuth.instance.signOut();
+      throw StateError('Sign-in expired while registering push notifications.');
     }
+    if (response.statusCode != 204) {
+      throw Exception(
+          'Push token registration failed (${response.statusCode}).');
+    }
+  }
+
+  void _registerPushTokenInBackground(String token) {
+    unawaited(_registerPushToken(token).catchError((Object error) {
+      debugPrint('Push token registration failed: $error');
+    }));
   }
 
   Future<void> _registerCurrentPushToken() async {
     try {
       final token = await _getPushToken(FirebaseMessaging.instance);
       if (token != null) await _registerPushToken(token);
-    } catch (_) {
-      // Firebase configuration may be added after the app is installed.
+    } catch (error) {
+      debugPrint('Could not register the current push token: $error');
     }
+  }
+
+  Future<void> _signOut() async {
+    try {
+      final token = await _getPushToken(FirebaseMessaging.instance);
+      if (token != null) {
+        final response = await http
+            .delete(Uri.parse('$_apiBase/api/push/register'),
+                headers: await apiAuthHeaders(jsonBody: true),
+                body: jsonEncode({'token': token}))
+            .timeout(const Duration(seconds: 5));
+        if (response.statusCode != 204) {
+          throw Exception(
+              'Push token removal failed (${response.statusCode}).');
+        }
+      }
+    } catch (error) {
+      if (mounted) _snack('Push notifications may remain enabled: $error');
+    }
+    await FirebaseAuth.instance.signOut();
   }
 
   Future<String?> _getPushToken(FirebaseMessaging messaging) async {
@@ -384,59 +438,167 @@ class _ChatHomeState extends State<ChatHome> {
   }
 
   Future<void> _refresh() async {
+    if (_refreshing) return;
+    _refreshing = true;
     try {
       final headers = await apiAuthHeaders();
+      await _ensureProfile(headers);
+      if (!_profileLoaded) return;
       final serversResponse = await http
           .get(Uri.parse('$_apiBase/api/servers'), headers: headers)
           .timeout(const Duration(seconds: 3));
-      if (serversResponse.statusCode == 200) {
-        final servers = (jsonDecode(serversResponse.body) as List)
-            .map((item) => ChatServer.fromJson(item as Map<String, dynamic>))
-            .toList();
-        if (servers.isNotEmpty) {
-          _servers = servers;
-          if (!servers.any((server) => server.id == _serverId)) {
-            _serverId = servers.first.id;
-          }
-        }
+      if (serversResponse.statusCode == 401) {
+        await FirebaseAuth.instance.signOut();
+        return;
+      }
+      if (serversResponse.statusCode != 200) {
+        throw Exception(
+            'Could not load servers (${serversResponse.statusCode})');
+      }
+      final servers = (jsonDecode(serversResponse.body) as List)
+          .map((item) => ChatServer.fromJson(item as Map<String, dynamic>))
+          .toList();
+      var selectedServerId = _serverId;
+      if (servers.isNotEmpty &&
+          !servers.any((server) => server.id == selectedServerId)) {
+        selectedServerId = servers.first.id;
       }
       final roomsResponse = await http
-          .get(Uri.parse('$_apiBase/api/rooms?server=$_serverId'),
+          .get(
+              Uri.parse('$_apiBase/api/rooms')
+                  .replace(queryParameters: {'server': selectedServerId}),
               headers: headers)
           .timeout(const Duration(seconds: 3));
-      if (roomsResponse.statusCode != 200)
-        throw Exception('Could not load rooms');
+      if (roomsResponse.statusCode == 401) {
+        await FirebaseAuth.instance.signOut();
+        return;
+      }
+      if (roomsResponse.statusCode != 200) {
+        throw Exception('Could not load rooms (${roomsResponse.statusCode})');
+      }
       final rooms = (jsonDecode(roomsResponse.body) as List)
           .map((item) => ChatRoom.fromJson(item as Map<String, dynamic>))
           .toList();
+      if (rooms.isEmpty) throw StateError('The selected server has no rooms.');
       final selected =
           rooms.any((r) => r.id == _roomId) ? _roomId : rooms.first.id;
       final roomWasRestored = selected != _roomId;
-      final messageResponse = await http
-          .get(Uri.parse('$_apiBase/api/messages?room=$_conversationId'),
-              headers: headers)
-          .timeout(const Duration(seconds: 3));
-      if (messageResponse.statusCode != 200)
-        throw Exception('Could not load messages');
-      final messages = (jsonDecode(messageResponse.body) as List)
-          .map((item) => ChatMessage.fromJson(item as Map<String, dynamic>))
-          .toList();
-      if (mounted)
+      var contacts = _contacts;
+      final shouldRefreshDMs = _lastDirectMessageFetch == null ||
+          DateTime.now().difference(_lastDirectMessageFetch!) >
+              const Duration(seconds: 30);
+      if (shouldRefreshDMs) {
+        final dmsResponse = await http
+            .get(Uri.parse('$_apiBase/api/dms'), headers: headers)
+            .timeout(const Duration(seconds: 3));
+        if (dmsResponse.statusCode == 401) {
+          await FirebaseAuth.instance.signOut();
+          return;
+        }
+        if (dmsResponse.statusCode != 200) {
+          throw Exception(
+              'Could not load direct messages (${dmsResponse.statusCode})');
+        }
+        contacts = (jsonDecode(dmsResponse.body) as List)
+            .map((item) =>
+                ChatContact.fromConversation(item as Map<String, dynamic>))
+            .toList();
+        _lastDirectMessageFetch = DateTime.now();
+      }
+      final activeDMID = _activeDM?.id ?? _savedDirectMessageId;
+      ChatContact? activeDM;
+      if (_showDirectMessages && activeDMID != null) {
+        for (final contact in contacts) {
+          if (contact.id == activeDMID) {
+            activeDM = contact;
+            break;
+          }
+        }
+      }
+      final conversationId =
+          _showDirectMessages ? activeDM?.conversationId : selected;
+      var messages = <ChatMessage>[];
+      if (conversationId != null) {
+        final messageResponse = await http
+            .get(
+                Uri.parse('$_apiBase/api/messages')
+                    .replace(queryParameters: {'room': conversationId}),
+                headers: headers)
+            .timeout(const Duration(seconds: 3));
+        if (messageResponse.statusCode == 401) {
+          await FirebaseAuth.instance.signOut();
+          return;
+        }
+        if (messageResponse.statusCode != 200) {
+          throw Exception(
+              'Could not load messages (${messageResponse.statusCode})');
+        }
+        messages = (jsonDecode(messageResponse.body) as List)
+            .map((item) => ChatMessage.fromJson(item as Map<String, dynamic>))
+            .toList();
+      }
+      if (mounted) {
         setState(() {
+          _servers = servers;
+          _serverId = selectedServerId;
           _rooms = rooms;
           _roomId = selected;
+          _contacts = contacts;
+          _activeDM = activeDM;
           _messages = messages;
           _online = true;
         });
+      }
       if (roomWasRestored) unawaited(_saveLastChat());
-    } catch (_) {
+    } catch (error) {
+      debugPrint('Chat refresh failed: $error');
       if (mounted) setState(() => _online = false);
+    } finally {
+      _refreshing = false;
+    }
+  }
+
+  Future<void> _ensureProfile(Map<String, String> headers) async {
+    if (_profileLoaded) return;
+    var response = await http
+        .get(Uri.parse('$_apiBase/api/me'), headers: headers)
+        .timeout(const Duration(seconds: 5));
+    if (response.statusCode == 404) {
+      final displayName = widget.user.displayName?.trim().isNotEmpty == true
+          ? widget.user.displayName!.trim()
+          : widget.user.email?.split('@').first ?? 'Member';
+      response = await http
+          .put(Uri.parse('$_apiBase/api/me'),
+              headers: await apiAuthHeaders(jsonBody: true),
+              body: jsonEncode({'displayName': displayName}))
+          .timeout(const Duration(seconds: 5));
+    }
+    if (response.statusCode == 401) {
+      await FirebaseAuth.instance.signOut();
+      return;
+    }
+    if (response.statusCode != 200) {
+      throw Exception('Could not load your profile (${response.statusCode})');
+    }
+    final profile = jsonDecode(response.body) as Map<String, dynamic>;
+    final displayName = profile['displayName'] as String;
+    _profileLoaded = true;
+    if (mounted) {
+      setState(() => _profileName = displayName);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('profileName', displayName);
     }
   }
 
   void _selectServer(ChatServer server) {
     if (_serverId == server.id) {
-      if (_showDirectMessages) setState(() => _showDirectMessages = false);
+      if (_showDirectMessages) {
+        setState(() {
+          _showDirectMessages = false;
+          _activeDM = null;
+        });
+        _refresh();
+      }
       return;
     }
     setState(() {
@@ -454,16 +616,58 @@ class _ChatHomeState extends State<ChatHome> {
   }
 
   void _startDirectMessage(ChatContact contact) {
-    setState(() {
-      _activeDM = contact;
-      _showDirectMessages = true;
-      _messages = const [];
-    });
-    unawaited(_saveLastChat());
-    if (MediaQuery.sizeOf(context).width < 720) {
-      _scaffoldKey.currentState?.closeDrawer();
+    unawaited(_openDirectMessage(contact));
+  }
+
+  Future<void> _openDirectMessage(ChatContact contact) async {
+    try {
+      var conversation = contact;
+      if (contact.conversationId == null) {
+        final response = await http
+            .post(Uri.parse('$_apiBase/api/dms'),
+                headers: await apiAuthHeaders(jsonBody: true),
+                body: jsonEncode({'userId': contact.id}))
+            .timeout(const Duration(seconds: 5));
+        if (response.statusCode == 401) {
+          await FirebaseAuth.instance.signOut();
+          return;
+        }
+        if (response.statusCode != 201) {
+          throw Exception(
+              'Could not start direct message (${response.statusCode})');
+        }
+        conversation = ChatContact.fromConversation(
+            jsonDecode(response.body) as Map<String, dynamic>);
+        _lastDirectMessageFetch = DateTime.now();
+      }
+      if (!mounted) return;
+      setState(() {
+        _contacts = [
+          conversation,
+          ..._contacts.where((item) => item.id != conversation.id)
+        ];
+        _activeDM = conversation;
+        _savedDirectMessageId = conversation.id;
+        _showDirectMessages = true;
+        _messages = const [];
+      });
+      await _saveLastChat();
+      if (!mounted) return;
+      if (MediaQuery.sizeOf(context).width < 720) {
+        _scaffoldKey.currentState?.closeDrawer();
+      }
+      await _refresh();
+    } catch (error) {
+      if (mounted) _snack('Could not open direct message: $error');
     }
-    _refresh();
+  }
+
+  Future<void> _openFindPeople() async {
+    final contact = await showDialog<ChatContact>(
+      context: context,
+      builder: (context) => FindPeopleDialog(apiBase: _apiBase),
+    );
+    if (contact != null) await _openDirectMessage(contact);
   }
 
   Future<void> _toggleFavorite(ChatContact contact) async {
@@ -480,13 +684,16 @@ class _ChatHomeState extends State<ChatHome> {
     await prefs.setString('lastRoomId', _roomId);
     if (_activeDM == null) {
       await prefs.remove('lastDirectMessageId');
+      _savedDirectMessageId = null;
     } else {
       await prefs.setString('lastDirectMessageId', _activeDM!.id);
+      _savedDirectMessageId = _activeDM!.id;
     }
   }
 
   void _openDirectMessages() {
     setState(() => _showDirectMessages = true);
+    unawaited(_refresh());
     if (MediaQuery.sizeOf(context).width < 720) {
       _scaffoldKey.currentState?.openDrawer();
     }
@@ -537,6 +744,10 @@ class _ChatHomeState extends State<ChatHome> {
   Future<void> _send() async {
     final content = _input.text.trim();
     if (content.isEmpty || _sending) return;
+    if (_showDirectMessages && _activeDM == null) {
+      _snack('Choose a conversation or find someone to message.');
+      return;
+    }
     if (_listening) {
       await _speech.stop();
       setState(() => _listening = false);
@@ -546,10 +757,7 @@ class _ChatHomeState extends State<ChatHome> {
       final response = await http
           .post(Uri.parse('$_apiBase/api/messages'),
               headers: await apiAuthHeaders(jsonBody: true),
-              body: jsonEncode({
-                'roomId': _conversationId,
-                'content': content
-              }))
+              body: jsonEncode({'roomId': _conversationId, 'content': content}))
           .timeout(const Duration(seconds: 5));
       if (response.statusCode < 300) {
         _input.clear();
@@ -898,12 +1106,6 @@ class _ChatHomeState extends State<ChatHome> {
                         ])),
                     actions: [
                       TextButton(
-                          onPressed: () async {
-                            Navigator.pop(dialogContext);
-                            await FirebaseAuth.instance.signOut();
-                          },
-                          child: const Text('Sign out')),
-                      TextButton(
                           onPressed: () => Navigator.pop(dialogContext),
                           child: const Text('Cancel')),
                       FilledButton(
@@ -927,21 +1129,15 @@ class _ChatHomeState extends State<ChatHome> {
     final modeName = prefs.getString('colorVisionMode');
     final savedApiBase = prefs.getString('apiBase');
     final savedDirectMessageId = prefs.getString('lastDirectMessageId');
-    ChatContact? restoredDirectMessage;
-    for (final contact in _contacts) {
-      if (contact.id == savedDirectMessageId) {
-        restoredDirectMessage = contact;
-        break;
-      }
-    }
     if (!mounted) return;
     setState(() {
       _apiBase = savedApiBase ?? apiBase;
       _apiBaseController.text = _apiBase;
       _serverId = prefs.getString('lastServerId') ?? _serverId;
       _roomId = prefs.getString('lastRoomId') ?? _roomId;
-      _activeDM = restoredDirectMessage;
-      _showDirectMessages = restoredDirectMessage != null;
+      _savedDirectMessageId = savedDirectMessageId;
+      _activeDM = null;
+      _showDirectMessages = savedDirectMessageId != null;
       _visionMode = ColorVisionMode.values.firstWhere(
           (mode) => mode.name == modeName,
           orElse: () => ColorVisionMode.standard);
@@ -1191,6 +1387,12 @@ class _ChatHomeState extends State<ChatHome> {
                                 ])))),
                     actions: [
                       TextButton(
+                          onPressed: () async {
+                            Navigator.pop(dialogContext);
+                            await _signOut();
+                          },
+                          child: const Text('Sign out')),
+                      TextButton(
                           onPressed: () => Navigator.pop(dialogContext),
                           child: const Text('Cancel')),
                       FilledButton(
@@ -1210,6 +1412,21 @@ class _ChatHomeState extends State<ChatHome> {
                             }
                             final normalized =
                                 entered.replaceFirst(RegExp(r'/+$'), '');
+                            final profileResponse = await http
+                                .put(Uri.parse('$normalized/api/me'),
+                                    headers:
+                                        await apiAuthHeaders(jsonBody: true),
+                                    body: jsonEncode({'displayName': name}))
+                                .timeout(const Duration(seconds: 5));
+                            if (profileResponse.statusCode == 401) {
+                              await FirebaseAuth.instance.signOut();
+                              return;
+                            }
+                            if (profileResponse.statusCode != 200) {
+                              _snack(
+                                  'Could not save your profile (${profileResponse.statusCode}).');
+                              return;
+                            }
                             final status = statusController.text.trim();
                             final prefs = await SharedPreferences.getInstance();
                             await prefs.setString('profileName', name);
@@ -1222,6 +1439,12 @@ class _ChatHomeState extends State<ChatHome> {
                               _profileStatus = status;
                               _profileColorValue = selectedColor;
                               _apiBase = normalized;
+                              _profileLoaded = true;
+                              _lastDirectMessageFetch = null;
+                              _contacts = [];
+                              _activeDM = null;
+                              _savedDirectMessageId = null;
+                              _showDirectMessages = false;
                               _speakerphone = speakerphone;
                               _frontCamera = frontCamera;
                               _videoHeight = videoHeight;
@@ -1473,6 +1696,10 @@ class _ChatHomeState extends State<ChatHome> {
   }
 
   Future<void> _startCall({required bool video, String? roomId}) async {
+    if (_showDirectMessages && _activeDM == null) {
+      _snack('Choose a direct conversation before starting a call.');
+      return;
+    }
     final session = CallSession(
         apiBase: _apiBase,
         roomId: roomId ?? _conversationId,
@@ -1604,21 +1831,43 @@ class _ChatHomeState extends State<ChatHome> {
         const Divider(height: 1, color: ink),
         if (_showDirectMessages)
           Expanded(
-              child:
-                  ListView(padding: const EdgeInsets.only(top: 8), children: [
-            _channelCategory('FAVORITES'),
-            if (_contacts
-                .where((contact) => _favoriteContactIds.contains(contact.id))
-                .isEmpty)
-              const Padding(
-                  padding: EdgeInsets.fromLTRB(18, 4, 12, 12),
-                  child: Text('Star a friend to add them here.',
-                      style: TextStyle(color: muted, fontSize: 11))),
-            ..._contacts
-                .where((contact) => _favoriteContactIds.contains(contact.id))
-                .map(_dmRow),
-            _channelCategory('FRIENDS'),
-            ..._contacts.map(_dmRow)
+              child: Column(children: [
+            Padding(
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+                child: OutlinedButton.icon(
+                    onPressed: _openFindPeople,
+                    icon: const Icon(Icons.person_add_alt_1, size: 18),
+                    label: const Text('Find people'))),
+            if (_contacts.isEmpty)
+              const Expanded(
+                  child: Center(
+                      child: Padding(
+                          padding: EdgeInsets.all(16),
+                          child: Text(
+                              'No conversations yet. Find people to start one.',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: muted, fontSize: 12)))))
+            else
+              Expanded(
+                  child: ListView(
+                      padding: const EdgeInsets.only(top: 8),
+                      children: [
+                    _channelCategory('FAVORITES'),
+                    if (_contacts
+                        .where((contact) =>
+                            _favoriteContactIds.contains(contact.id))
+                        .isEmpty)
+                      const Padding(
+                          padding: EdgeInsets.fromLTRB(18, 4, 12, 12),
+                          child: Text('Star a conversation to add it here.',
+                              style: TextStyle(color: muted, fontSize: 11))),
+                    ..._contacts
+                        .where((contact) =>
+                            _favoriteContactIds.contains(contact.id))
+                        .map(_dmRow),
+                    _channelCategory('CONVERSATIONS'),
+                    ..._contacts.map(_dmRow)
+                  ]))
           ]))
         else ...[
           Padding(
@@ -1732,7 +1981,7 @@ class _ChatHomeState extends State<ChatHome> {
                   CircleAvatar(
                       radius: 12,
                       backgroundColor: contact.color,
-                      child: Text(contact.name[0],
+                      child: Text(contact.name.isEmpty ? '?' : contact.name[0],
                           style: const TextStyle(
                               color: Colors.white, fontSize: 11))),
                   const SizedBox(width: 9),
@@ -1848,12 +2097,15 @@ class _ChatHomeState extends State<ChatHome> {
                           maxLines: 5,
                           textInputAction: TextInputAction.send,
                           onSubmitted: (_) => _send(),
+                          readOnly: _showDirectMessages && _activeDM == null,
                           decoration: InputDecoration(
                               hintText: _listening
                                   ? 'Listening… speak your message'
-                                  : _activeDM == null
-                                      ? 'Message #${_room.name}'
-                                      : 'Message ${_activeDM!.name}',
+                                  : _showDirectMessages && _activeDM == null
+                                      ? 'Find a person to start a conversation'
+                                      : _activeDM == null
+                                          ? 'Message #${_room.name}'
+                                          : 'Message ${_activeDM!.name}',
                               hintStyle: const TextStyle(color: muted),
                               border: InputBorder.none))),
                   IconButton(
@@ -1873,7 +2125,10 @@ class _ChatHomeState extends State<ChatHome> {
                       icon: Icon(_listening ? Icons.mic : Icons.mic_none,
                           color: _listening ? Colors.redAccent : muted)),
                   IconButton(
-                      onPressed: _sending ? null : _send,
+                      onPressed:
+                          _sending || (_showDirectMessages && _activeDM == null)
+                              ? null
+                              : _send,
                       icon: Icon(Icons.send_rounded, color: accent))
                 ]))),
       ]);
@@ -1892,9 +2147,9 @@ class _ChatHomeState extends State<ChatHome> {
                 icon: const Icon(Icons.menu, color: muted)),
             Expanded(
                 child: Text(
-                    _activeDM == null
-                        ? '# ${_room.name}'
-                        : '@ ${_activeDM!.name}',
+                    _showDirectMessages
+                        ? _activeDM?.name ?? 'Direct Messages'
+                        : '# ${_room.name}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(fontWeight: FontWeight.w700))),
@@ -1924,10 +2179,12 @@ class _ChatHomeState extends State<ChatHome> {
         decoration: const BoxDecoration(
             color: panel, border: Border(bottom: BorderSide(color: ink))),
         child: Row(children: [
-          Text(_activeDM == null ? '#' : '@',
+          Text(_showDirectMessages ? '@' : '#',
               style: const TextStyle(color: muted, fontSize: 22)),
           const SizedBox(width: 10),
-          Text(_activeDM?.name ?? _room.name,
+          Text(
+              _activeDM?.name ??
+                  (_showDirectMessages ? 'Direct Messages' : _room.name),
               style: const TextStyle(fontWeight: FontWeight.w700)),
           const SizedBox(width: 16),
           Container(width: 1, height: 22, color: panelLight),
@@ -1964,6 +2221,7 @@ class _ChatHomeState extends State<ChatHome> {
 
   Widget _welcomeHeader() {
     final directMessage = _activeDM;
+    final directMessageList = _showDirectMessages && directMessage == null;
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Container(
           width: 68,
@@ -1972,19 +2230,23 @@ class _ChatHomeState extends State<ChatHome> {
               color: directMessage?.color ?? panelLight,
               borderRadius: BorderRadius.circular(34)),
           alignment: Alignment.center,
-          child: Text(directMessage?.name[0] ?? '#',
+          child: Text(directMessage?.name[0] ?? (directMessageList ? '@' : '#'),
               style:
                   const TextStyle(fontSize: 42, fontWeight: FontWeight.w800))),
       const SizedBox(height: 14),
       Text(
           directMessage == null
-              ? 'Welcome to #${_room.name}!'
+              ? directMessageList
+                  ? 'Start a direct conversation'
+                  : 'Welcome to #${_room.name}!'
               : 'Message ${directMessage.name}',
           style: const TextStyle(fontSize: 27, fontWeight: FontWeight.w800)),
       const SizedBox(height: 5),
       Text(
           directMessage == null
-              ? 'This is the beginning of this channel.'
+              ? directMessageList
+                  ? 'Find a verified ChatterBox member to start messaging.'
+                  : 'This is the beginning of this channel.'
               : 'This is your direct conversation with ${directMessage.name}.',
           style: const TextStyle(color: muted))
     ]);
@@ -1995,9 +2257,11 @@ class _ChatHomeState extends State<ChatHome> {
         _welcomeHeader(),
         const SizedBox(height: 20),
         Text(
-            _online
-                ? 'Start the conversation.'
-                : 'Start the Go server to connect.',
+            _showDirectMessages && _activeDM == null
+                ? 'Use Find people to start a conversation.'
+                : _online
+                    ? 'Start the conversation.'
+                    : 'Can’t connect to the chat server.',
             style: const TextStyle(color: muted))
       ]));
 
@@ -2013,7 +2277,7 @@ class _ChatHomeState extends State<ChatHome> {
       Color(0xFF7BADE2), // light blue
       Color(0xFFF0E442), // yellow
     ];
-    final color = message.author == _profileName
+    final color = message.authorId == widget.user.uid
         ? _profileColor
         : authorPalette[message.author.hashCode.abs() % authorPalette.length];
     final localTime = message.createdAt.toLocal();
@@ -2078,28 +2342,29 @@ class _ChatHomeState extends State<ChatHome> {
       color: panel,
       padding: const EdgeInsets.fromLTRB(16, 22, 12, 12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('ONLINE — 3',
-            style: TextStyle(
+        Text('RECENT CONVERSATIONS — ${_contacts.length}',
+            style: const TextStyle(
                 color: muted,
                 fontSize: 11,
                 fontWeight: FontWeight.w700,
                 letterSpacing: .6)),
         const SizedBox(height: 14),
-        _member('Maya Chen', 'Building something cool', const Color(0xFFB478D3),
-            onTap: () => _startDirectMessage(_contacts[0])),
-        _member('Leo Park', 'Listening to music', const Color(0xFF55B99A),
-            onTap: () => _startDirectMessage(_contacts[1])),
-        _member(_profileName, _profileStatus, _profileColor),
-        const SizedBox(height: 24),
-        const Text('OFFLINE — 1',
-            style: TextStyle(
-                color: muted,
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-                letterSpacing: .6)),
-        const SizedBox(height: 14),
-        _member('Sam Rivera', 'Away', const Color(0xFFE49A5A),
-            online: false, onTap: () => _startDirectMessage(_contacts[2]))
+        if (_contacts.isEmpty)
+          const Text('Your direct conversations will appear here.',
+              style: TextStyle(color: muted, fontSize: 12))
+        else
+          ..._contacts.take(10).map((contact) => _member(
+                contact.name,
+                'Direct message',
+                contact.color,
+                online: false,
+                onTap: () => _startDirectMessage(contact),
+              )),
+        const SizedBox(height: 8),
+        TextButton.icon(
+            onPressed: _openFindPeople,
+            icon: const Icon(Icons.person_add_alt_1, size: 18),
+            label: const Text('Find people'))
       ]));
   Widget _member(String name, String status, Color color,
           {bool online = true, VoidCallback? onTap}) =>
@@ -2111,7 +2376,9 @@ class _ChatHomeState extends State<ChatHome> {
               child: Row(children: [
                 Stack(children: [
                   CircleAvatar(
-                      radius: 17, backgroundColor: color, child: Text(name[0])),
+                      radius: 17,
+                      backgroundColor: color,
+                      child: Text(name.isEmpty ? '?' : name[0])),
                   Positioned(
                       right: 0,
                       bottom: 0,
@@ -2138,4 +2405,156 @@ class _ChatHomeState extends State<ChatHome> {
                           style: const TextStyle(color: muted, fontSize: 10))
                     ]))
               ])));
+}
+
+class FindPeopleDialog extends StatefulWidget {
+  const FindPeopleDialog({super.key, required this.apiBase});
+
+  final String apiBase;
+
+  @override
+  State<FindPeopleDialog> createState() => _FindPeopleDialogState();
+}
+
+class _FindPeopleDialogState extends State<FindPeopleDialog> {
+  final _queryController = TextEditingController();
+  final _searchResults = <ChatContact>[];
+  Timer? _searchDebounce;
+  int _searchRequest = 0;
+  bool _searching = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _searchDebounce?.cancel();
+    _queryController.dispose();
+    super.dispose();
+  }
+
+  void _onQueryChanged(String value) {
+    _searchDebounce?.cancel();
+    final request = ++_searchRequest;
+    final query = value.trim();
+    if (query.runes.length < 2) {
+      setState(() {
+        _searchResults.clear();
+        _searching = false;
+        _error = null;
+      });
+      return;
+    }
+    setState(() {
+      _searchResults.clear();
+      _searching = true;
+      _error = null;
+    });
+    _searchDebounce = Timer(const Duration(milliseconds: 300), () {
+      unawaited(_search(query, request));
+    });
+  }
+
+  Future<void> _search(String query, int request) async {
+    try {
+      final response = await http
+          .get(
+              Uri.parse('${widget.apiBase}/api/users')
+                  .replace(queryParameters: {'query': query}),
+              headers: await apiAuthHeaders())
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode == 401) {
+        await FirebaseAuth.instance.signOut();
+        throw StateError('Your sign-in expired. Please sign in again.');
+      }
+      if (response.statusCode != 200) {
+        throw Exception('User search failed (${response.statusCode}).');
+      }
+      final results = (jsonDecode(response.body) as List)
+          .map((item) => ChatContact.fromProfile(item as Map<String, dynamic>))
+          .toList();
+      if (mounted && request == _searchRequest) {
+        setState(() => _searchResults
+          ..clear()
+          ..addAll(results));
+      }
+    } catch (error) {
+      if (mounted && request == _searchRequest) {
+        setState(() => _error = 'Could not search users: $error');
+      }
+    } finally {
+      if (mounted && request == _searchRequest) {
+        setState(() => _searching = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('Find people'),
+        content: SizedBox(
+          width: 440,
+          height: 380,
+          child: Column(
+            children: [
+              TextField(
+                controller: _queryController,
+                autofocus: true,
+                textInputAction: TextInputAction.search,
+                onChanged: _onQueryChanged,
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search),
+                  labelText: 'Search display names',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              if (_searching) const LinearProgressIndicator(),
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(
+                    _error!,
+                    style:
+                        TextStyle(color: Theme.of(context).colorScheme.error),
+                  ),
+                ),
+              Expanded(
+                child: _searchResults.isEmpty
+                    ? Center(
+                        child: Text(
+                          _queryController.text.trim().runes.length < 2
+                              ? 'Enter at least 2 characters.'
+                              : _searching
+                                  ? 'Searching…'
+                                  : 'No matching verified users.',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: muted),
+                        ),
+                      )
+                    : ListView.builder(
+                        itemCount: _searchResults.length,
+                        itemBuilder: (context, index) {
+                          final contact = _searchResults[index];
+                          return ListTile(
+                            leading: CircleAvatar(
+                              backgroundColor: contact.color,
+                              child: Text(contact.name.isEmpty
+                                  ? '?'
+                                  : contact.name[0].toUpperCase()),
+                            ),
+                            title: Text(contact.name),
+                            subtitle: const Text('Verified ChatterBox member'),
+                            onTap: () => Navigator.pop(context, contact),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      );
 }

@@ -54,7 +54,7 @@ class _AuthGateState extends State<AuthGate> {
       stream: FirebaseAuth.instance.userChanges(),
       builder: (context, snapshot) {
         if (snapshot.hasError) {
-          return _AuthMessageScreen(
+          return const _AuthMessageScreen(
             title: 'Authentication unavailable',
             message: 'Could not check your account. Please try again later.',
           );
@@ -135,8 +135,9 @@ class _SignInScreenState extends State<SignInScreen> {
     } on FirebaseAuthException catch (error) {
       if (mounted) setState(() => _error = _authErrorMessage(error));
     } catch (error) {
-      if (mounted)
+      if (mounted) {
         setState(() => _error = 'Could not complete sign-in: $error');
+      }
     } finally {
       if (mounted) setState(() => _working = false);
     }
@@ -298,12 +299,14 @@ class _EmailVerificationScreenState extends State<EmailVerificationScreen> {
     });
     try {
       await widget.user.reload();
+      if (!mounted) return;
       final currentUser = FirebaseAuth.instance.currentUser;
       if (currentUser == null) {
         widget.onVerified();
         return;
       }
       await currentUser.getIdToken(true);
+      if (!mounted) return;
       if (currentUser.emailVerified) {
         widget.onVerified();
       } else if (mounted) {

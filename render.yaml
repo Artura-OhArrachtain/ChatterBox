@@ -7,3 +7,8 @@ services:
     startCommand: ./server/chatterbox-server
     healthCheckPath: /health
     autoDeploy: true
+    envVars:
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        sync: false
