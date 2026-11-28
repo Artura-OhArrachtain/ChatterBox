@@ -1300,6 +1300,7 @@ class _ChatHomeState extends State<ChatHome> {
                             constraints: BoxConstraints(
                                 maxHeight:
                                     MediaQuery.sizeOf(context).height * .68),
+t	SizedBox(height: MediaQuery.sizeOf(context).height * 0.7,
                             child: SingleChildScrollView(
                                 child: Column(
                                     crossAxisAlignment:
@@ -1809,7 +1810,7 @@ class _ChatHomeState extends State<ChatHome> {
     return Scaffold(
       key: _scaffoldKey,
       drawer: phone
-          ? Drawer(child: SizedBox(width: 280, child: _channelPanel()))
+          ? Drawer(child: _channelPanel()))
           : null,
       body: _applyColorSettings(SafeArea(
           child: Row(children: [
