@@ -1300,12 +1300,16 @@ class _ChatHomeState extends State<ChatHome> {
                             constraints: BoxConstraints(
                                 maxHeight:
                                     MediaQuery.sizeOf(context).height * .68),
-t	SizedBox(height: MediaQuery.sizeOf(context).height * 0.7,
-                            child: SingleChildScrollView(
-                                child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
+                            child: SizedBox(
+    height: MediaQuery.sizeOf(context).height * 0.7,
+    child: SingleChildScrollView(
+        child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [...]
+        )
+    )
+)
+
                                   const Text('ACCOUNT',
                                       style: TextStyle(
                                           color: muted,
@@ -1810,7 +1814,7 @@ t	SizedBox(height: MediaQuery.sizeOf(context).height * 0.7,
     return Scaffold(
       key: _scaffoldKey,
       drawer: phone
-          ? Drawer(child: _channelPanel()))
+          ? Drawer(child: SizedBox(width: 280, child: _channelPanel()))
           : null,
       body: _applyColorSettings(SafeArea(
           child: Row(children: [
